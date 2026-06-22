@@ -19,7 +19,7 @@ class Joiner(nn.Sequential):
         super().__init__(backbone, position_embedding)
 
     def forward(self, tensor_list: NestedTensor):
-        xs = self[0](tensor_list)
+        xs = self[0](tensor_list) # 得到带有掩码的三层输出特征图
         out: List[NestedTensor] = []
         pos = []
         for _, x in xs.items():
@@ -40,15 +40,15 @@ class MaskedBackbone(nn.Module):
         self.num_channels = backbone_shape[list(backbone_shape.keys())[-1]].channels
 
     def forward(self, images):
-        features = self.backbone(images.tensor)
-        masks = self.mask_out_padding(
+        features = self.backbone(images.tensor) # 得到resnet的三层输出特征
+        masks = self.mask_out_padding( # mask padding区域
             [features_per_level.shape for features_per_level in features.values()],
             images.image_sizes,
             images.tensor.device,
         )
         assert len(features) == len(masks)
         for i, k in enumerate(features.keys()):
-            features[k] = NestedTensor(features[k], masks[i])
+            features[k] = NestedTensor(features[k], masks[i]) # 打包feature和mask
         return features
 
     def mask_out_padding(self, feature_shapes, image_sizes, device):
@@ -184,7 +184,7 @@ class TransformerPureDetector(nn.Module):
         images = self.preprocess_image(batched_inputs)
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            targets = self.prepare_targets(gt_instances)
+            targets = self.prepare_targets(gt_instances) # cls、coord、bbox
             output = self.dptext_detr(images)
             # compute the loss
             loss_dict = self.criterion(output, targets)

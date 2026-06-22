@@ -1,20 +1,21 @@
 _BASE_: "../Base.yaml"
 
 DATASETS:
-  TRAIN: ("totaltext_poly_train_rotate_pos",)
+  TRAIN: ("totaltext_poly_train_ori",)
   TEST: ("totaltext_poly_test",)  # or "inversetext_test", "totaltext_poly_test_rotate"
 
 MODEL:
-  WEIGHTS: "output/r_50_poly/pretrain/model_final.pth"  # or the provided pre-trained model
+  WEIGHTS: "pretrain.pth"  # official pre-trained model
+  GA_STEPS: 4            # gradient accumulation: IMS_PER_BATCH * GA_STEPS = 2 * 4 = 8 effective
 
 SOLVER:
-  IMS_PER_BATCH: 8
+  IMS_PER_BATCH: 2
   BASE_LR: 5e-5
   LR_BACKBONE: 5e-6
   WARMUP_ITERS: 0
   STEPS: (16000,)
   MAX_ITER: 20000
-  CHECKPOINT_PERIOD: 20000
+  CHECKPOINT_PERIOD: 2000
 
 TEST:
   EVAL_PERIOD: 1000

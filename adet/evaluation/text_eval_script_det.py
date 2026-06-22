@@ -5,7 +5,6 @@ from adet.evaluation import rrc_evaluation_funcs_det
 import importlib
 import sys
 import json
-from rapidfuzz import string_metric
 
 
 def evaluation_imports():

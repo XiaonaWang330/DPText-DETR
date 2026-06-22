@@ -35,7 +35,8 @@ class DeformableTransformer_Det(nn.Module):
             num_proposals=100,
             num_ctrl_points=16,
             epqm=False,
-            efsa=False
+            efsa=False,
+            use_clip_lang_prior=False
     ):
         super().__init__()
 
@@ -62,7 +63,8 @@ class DeformableTransformer_Det(nn.Module):
             num_feature_levels,
             nhead,
             dec_n_points,
-            efsa
+            efsa,
+            use_clip_lang_prior=use_clip_lang_prior
         )
         self.decoder = DeformableTransformerDecoder_Det(
             decoder_layer,
@@ -170,7 +172,7 @@ class DeformableTransformer_Det(nn.Module):
 
         return reference_points
 
-    def forward(self, srcs, masks, pos_embeds, query_embed):
+    def forward(self, srcs, masks, pos_embeds, query_embed, c_lang=None, v_spatial=None):
         # prepare input for encoder
         src_flatten = []
         mask_flatten = []
@@ -235,7 +237,9 @@ class DeformableTransformer_Det(nn.Module):
             level_start_index,
             valid_ratios,
             query_pos=query_pos if not self.epqm else None,
-            src_padding_mask=mask_flatten
+            src_padding_mask=mask_flatten,
+            c_lang=c_lang,
+            v_spatial=v_spatial
         )
         inter_references_out = inter_references
 
@@ -361,11 +365,13 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
             n_levels=4,
             n_heads=8,
             n_points=4,
-            efsa=False
+            efsa=False,
+            use_clip_lang_prior=False
     ):
         super().__init__()
 
         self.efsa = efsa
+        self.use_clip_lang_prior = use_clip_lang_prior
 
         # cross attention
         self.attn_cross = MSDeformAttn(d_model, n_levels, n_heads, n_points)
@@ -397,6 +403,21 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
 
+        # ---- V12: sigmoid gate (V9 proven) — targets Precision ----
+        if self.use_clip_lang_prior:
+            # c_lang -> per-channel sigmoid gate: "how much to trust spatial signal"
+            self.lang_to_gamma = nn.Linear(d_model, d_model)
+            nn.init.zeros_(self.lang_to_gamma.weight)
+            nn.init.constant_(self.lang_to_gamma.bias, -5.0)  # sigmoid(-5)≈0.007 ≈ cold start
+
+            # v_spatial -> per-point spatial visual signal
+            self.lang_to_v = nn.Linear(d_model, d_model)
+            nn.init.zeros_(self.lang_to_v.weight)
+            nn.init.zeros_(self.lang_to_v.bias)
+
+            # learnable scalar, zero-init -> iter 0 == baseline
+            self.v_scale = nn.Parameter(torch.zeros(1))
+
     @staticmethod
     def with_pos_embed(tensor, pos):
         return tensor if pos is None else tensor + pos
@@ -415,7 +436,9 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
             src,
             src_spatial_shapes,
             level_start_index,
-            src_padding_mask=None
+            src_padding_mask=None,
+            c_lang=None,
+            v_spatial=None,
     ):
         # input size
         # - tgt:        (bs, n_q, n_pts, dim)
@@ -473,6 +496,20 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
         # ffn
         tgt = self.forward_ffn(tgt)
 
+        # ---- V12: post-FFN sigmoid gate + spatial injection (V9 proven, targets Precision) ----
+        # gamma: per-channel gate ∈ [0,1] — "how much spatial info to add"
+        # v_spatial: per-point signal — "what spatial info to add"
+        # Global control + spatial content, granularity matched (finding #5, #6)
+        if self.use_clip_lang_prior and c_lang is not None and v_spatial is not None:
+            gamma = torch.sigmoid(self.lang_to_gamma(c_lang))     # (B, 256) ∈ [0,1]
+            gamma = gamma[:, None, None, :]                       # (B, 1, 1, 256)
+
+            v = self.lang_to_v(v_spatial)                         # (B, n_pts, 256)
+            v = v[:, None, :, :]                                  # (B, 1, n_pts, 256)
+
+            # zero-init → iter 0 == baseline
+            tgt = tgt + self.v_scale * gamma * v
+
         return tgt
 
 
@@ -506,7 +543,9 @@ class DeformableTransformerDecoder_Det(nn.Module):
             src_level_start_index,
             src_valid_ratios,
             query_pos=None,
-            src_padding_mask=None
+            src_padding_mask=None,
+            c_lang=None,
+            v_spatial=None
     ):
         output = tgt  # bs, n_q, n_pts, 256
         if self.epqm:
@@ -542,7 +581,9 @@ class DeformableTransformerDecoder_Det(nn.Module):
                 src,
                 src_spatial_shapes,
                 src_level_start_index,
-                src_padding_mask
+                src_padding_mask,
+                c_lang=c_lang,
+                v_spatial=v_spatial
             )
 
             # update the reference points

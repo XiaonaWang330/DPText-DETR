@@ -8,7 +8,7 @@ MODEL:
   WEIGHTS: "pretrain.pth"  # official pre-trained model
   GA_STEPS: 4  # gradient accumulation, effective batch = IMS_PER_BATCH * GA_STEPS = 8
   TRANSFORMER:
-    USE_SOH: True
+    USE_SOH: False  # pure baseline, no SOH
 
 SOLVER:
   IMS_PER_BATCH: 2
@@ -17,7 +17,7 @@ SOLVER:
   WARMUP_ITERS: 0
   STEPS: (100000,) # no step
   MAX_ITER: 13000
-  CHECKPOINT_PERIOD: 1000  # save "last" checkpoint every 1000 iters for resume
+  CHECKPOINT_PERIOD: 1000
 
 INPUT:
   MIN_SIZE_TEST: 1000 
@@ -26,4 +26,4 @@ INPUT:
 TEST:
   EVAL_PERIOD: 1000
 
-OUTPUT_DIR: "output/r_50_poly/ctw1500/V2"
+OUTPUT_DIR: "output/r_50_poly/ctw1500/baseline"

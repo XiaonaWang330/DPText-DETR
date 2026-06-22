@@ -25,7 +25,7 @@ _PREDEFINED_SPLITS_TEXT = {
     "totaltext_poly_train_pos": ("totaltext/train_images_rotate", "totaltext/train_poly_pos.json"),
     "totaltext_poly_train_rotate_ori": ("totaltext/train_images_rotate", "totaltext/train_poly_rotate_ori.json"),
     "totaltext_poly_train_rotate_pos": ("totaltext/train_images_rotate", "totaltext/train_poly_rotate_pos.json"),
-    "ctw1500_poly_train_rotate_pos": ("ctw1500/train_images_rotate", "ctw1500/train_poly_rotate_pos.json"),
+    "ctw1500_poly_train_rotate_pos": ("ctw1500/train_images_rotate", "ctw1500/train_poly_rotate_pos_filtered.json"),
     "lsvt_poly_train_pos": ("lsvt/train_images","lsvt/train_poly_pos.json"),
     "art_poly_train_pos": ("art/train_images_rotate","art/train_poly_pos.json"),
     "art_poly_train_rotate_pos": ("art/train_images_rotate","art/train_poly_rotate_pos.json"),
@@ -35,6 +35,10 @@ _PREDEFINED_SPLITS_TEXT = {
     "ctw1500_poly_test": ("ctw1500/test_images","ctw1500/test_poly.json"),
     "art_test": ("art/test_images","art/test_poly.json"),
     "inversetext_test": ("inversetext/test_images","inversetext/test_poly.json"),
+    "icdar2015_train": ("icdar2015/textdet_imgs/train","icdar2015/train_poly.json"),
+    "icdar2015_train_pos": ("icdar2015/textdet_imgs/train","icdar2015/train_poly_pos.json"),
+    "icdar2015_test": ("icdar2015/textdet_imgs/test","icdar2015/test_poly.json"),
+    "icdar2015_test_pos": ("icdar2015/textdet_imgs/test","icdar2015/test_poly_pos.json"),
 }
 
 metadata_text = {

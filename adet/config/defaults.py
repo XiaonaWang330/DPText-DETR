@@ -5,6 +5,7 @@ from detectron2.config import CfgNode as CN
 # ---------------------------------------------------------------------------- #
 # Additional Configs
 # ---------------------------------------------------------------------------- #
+_C.MODEL.GA_STEPS = 1  # gradient accumulation steps (effective batch = IMS_PER_BATCH * GA_STEPS)
 _C.MODEL.MOBILENET = False
 _C.MODEL.BACKBONE.ANTI_ALIAS = False
 _C.MODEL.RESNETS.DEFORM_INTERVAL = 1
@@ -359,6 +360,10 @@ _C.MODEL.TRANSFORMER.NUM_CTRL_POINTS = 16
 
 _C.MODEL.TRANSFORMER.EPQM = False # for DPText-DETR
 _C.MODEL.TRANSFORMER.EFSA = False
+
+_C.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR = False  # V9: CLIP language prior with image-adaptive prompts
+_C.MODEL.TRANSFORMER.CLIP_MODEL_PATH = ""  # V9: local path to CLIP weights (empty = use HF hub)
+
 
 _C.MODEL.TRANSFORMER.LOSS = CN()
 _C.MODEL.TRANSFORMER.LOSS.AUX_LOSS = True

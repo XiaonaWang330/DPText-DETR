@@ -54,7 +54,13 @@ def gen_crop_transform_with_instance(crop_size, image_size, instances, crop_box=
                 )
                 return T.CropTransform(0, 0, image_size[1], image_size[0])
 
-    return T.CropTransform(*map(int, (x0, y0, crop_size[1], crop_size[0])))
+    # Ensure crop dimensions are at least 1 pixel to prevent zero-size images
+    # (can happen with very small images + relative_range crop type)
+    w = max(int(crop_size[1]), 1)
+    h = max(int(crop_size[0]), 1)
+    x0 = max(int(x0), 0)
+    y0 = max(int(y0), 0)
+    return T.CropTransform(x0, y0, w, h)
 
 
 def adjust_crop(x0, y0, crop_size, instances, eps=1e-3):
@@ -104,6 +110,9 @@ class RandomCropWithInstance(RandomCrop):
     def get_transform(self, img, boxes):
         image_size = img.shape[:2]
         crop_size = self.get_crop_size(image_size)
+        # Ensure minimum crop size to avoid zero-dimension images
+        # (can happen when relative crop size * small image rounds to 0)
+        crop_size = (max(crop_size[0], 1), max(crop_size[1], 1))
         return gen_crop_transform_with_instance(
             crop_size, image_size, boxes, crop_box=self.crop_instance
         )

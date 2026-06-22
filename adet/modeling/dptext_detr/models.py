@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from adet.layers.deformable_transformer import DeformableTransformer_Det
 from adet.utils.misc import NestedTensor, inverse_sigmoid_offset, nested_tensor_from_tensor_list, sigmoid_offset
 from .utils import MLP
+from .clip_language_prior import CLIPLanguagePrior
 
 
 class DPText_DETR(nn.Module):
@@ -33,7 +34,17 @@ class DPText_DETR(nn.Module):
 
         self.epqm = cfg.MODEL.TRANSFORMER.EPQM
         self.efsa = cfg.MODEL.TRANSFORMER.EFSA
+        self.use_clip_lang_prior = cfg.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR
         self.ctrl_point_embed = nn.Embedding(self.num_ctrl_points, self.d_model)
+
+        # V9: CLIP language prior with per-layer sigmoid gate
+        if self.use_clip_lang_prior:
+            clip_model_path = cfg.MODEL.TRANSFORMER.get("CLIP_MODEL_PATH", "")
+            self.clip_lang_prior = CLIPLanguagePrior(
+                d_model=self.d_model,
+                num_ctrl_points=self.num_ctrl_points,
+                clip_model_path=clip_model_path if clip_model_path else None,
+            )
 
         self.transformer = DeformableTransformer_Det(
             d_model=self.d_model,
@@ -50,7 +61,8 @@ class DPText_DETR(nn.Module):
             num_proposals=self.num_proposals,
             num_ctrl_points=self.num_ctrl_points,
             epqm=self.epqm,
-            efsa=self.efsa
+            efsa=self.efsa,
+            use_clip_lang_prior=self.use_clip_lang_prior
         )
         self.ctrl_point_class = nn.Linear(self.d_model, self.num_classes)
         self.ctrl_point_coord = MLP(self.d_model, self.d_model, 2, 3)
@@ -151,8 +163,13 @@ class DPText_DETR(nn.Module):
         # n_pts, embed_dim --> n_q, n_pts, embed_dim
         ctrl_point_embed = self.ctrl_point_embed.weight[None, ...].repeat(self.num_proposals, 1, 1)
 
+        # V9: CLIP language prior
+        c_lang, v_spatial = None, None
+        if self.use_clip_lang_prior:
+            c_lang, v_spatial = self.clip_lang_prior(srcs[-2], srcs[-1])
+
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(
-            srcs, masks, pos, ctrl_point_embed
+            srcs, masks, pos, ctrl_point_embed, c_lang=c_lang, v_spatial=v_spatial
         )
 
         outputs_classes = []

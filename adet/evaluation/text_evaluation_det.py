@@ -68,6 +68,8 @@ class TextDetEvaluator(DatasetEvaluator):
             self.submit = True
         elif "inversetext" in dataset_name:
             self._text_eval_gt_path = "datasets/evaluation/gt_inversetext.zip"
+        elif "icdar2015" in dataset_name:
+            self._text_eval_gt_path = "datasets/evaluation/gt_icdar2015.zip"
         else:
             raise NotImplementedError
 
@@ -118,13 +120,13 @@ class TextDetEvaluator(DatasetEvaluator):
         os.remove("temp_all_det_cors.txt")
 
     def sort_detection(self, temp_dir):
-        origin_file = temp_dir
-        output_file = "final_"+temp_dir
+        origin_file = os.path.normpath(temp_dir)
+        output_file = os.path.normpath("final_"+temp_dir)
 
         if not os.path.isdir(output_file):
             os.mkdir(output_file)
 
-        files = glob.glob(origin_file+'*.txt')
+        files = glob.glob(os.path.join(origin_file, '*.txt'))
         files.sort()
 
         for i in files:

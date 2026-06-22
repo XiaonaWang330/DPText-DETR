@@ -17,6 +17,14 @@ You may want to write your own script with your datasets and other customization
 
 import logging
 import os
+import sys
+
+# Ensure DPText-DETR's adet is found before any other adet on PYTHONPATH
+_PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJ_ROOT not in sys.path:
+    sys.path.insert(0, _PROJ_ROOT)
+
+import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
 import torch
@@ -53,9 +61,12 @@ class Trainer(DefaultTrainer):
     def build_hooks(self):
         """
         Replace `DetectionCheckpointer` with `AdetCheckpointer`.
+        Add `BestCheckpointer` to save best model based on hmean (F1).
 
-        Build a list of default hooks, including timing, evaluation,
-        checkpointing, lr scheduling, precise BN, writing events.
+        Hook execution order in after_step():
+          - PeriodicCheckpointer  -> save "last" checkpoint (for resume)
+          - EvalHook              -> run evaluation, store metrics in storage
+          - BestCheckpointer      -> save "best" checkpoint if hmean improved
         """
         ret = super().build_hooks()
         for i in range(len(ret)):
@@ -66,13 +77,87 @@ class Trainer(DefaultTrainer):
                     optimizer=self.optimizer,
                     scheduler=self.scheduler,
                 )
-                ret[i] = hooks.PeriodicCheckpointer(self.checkpointer, self.cfg.SOLVER.CHECKPOINT_PERIOD)
+                ret[i] = hooks.PeriodicCheckpointer(
+                    self.checkpointer, self.cfg.SOLVER.CHECKPOINT_PERIOD,
+                    max_iter=self.max_iter
+                )
+            elif isinstance(ret[i], hooks.EvalHook):
+                # Insert BestCheckpointer AFTER EvalHook so it can read freshly-stored metrics
+                ret.insert(i + 1, hooks.BestCheckpointer(
+                    eval_period=self.cfg.TEST.EVAL_PERIOD,
+                    checkpointer=self.checkpointer,
+                    val_metric="DET_RESULT/hmean",
+                    mode="max",
+                    file_prefix="model_best",
+                ))
         return ret
     
     def resume_or_load(self, resume=True):
         checkpoint = self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume)
         if resume and self.checkpointer.has_checkpoint():
             self.start_iter = checkpoint.get("iteration", -1) + 1
+
+    def run_step(self):
+        """
+        Override run_step to support gradient accumulation with AMP.
+        Effective batch size = IMS_PER_BATCH * MODEL.GA_STEPS.
+        """
+        assert self.model.training, "[Trainer] model was changed to eval mode!"
+        ga_steps = self.cfg.MODEL.GA_STEPS
+
+        if ga_steps <= 1:
+            return super().run_step()
+
+        _trainer = self._trainer  # the inner SimpleTrainer instance
+
+        # Lazy-init AMP GradScaler (used below and in optimizer.step)
+        if not hasattr(self, "_amp_scaler"):
+            self._amp_scaler = torch.cuda.amp.GradScaler()
+
+        start = time.perf_counter()
+        data = next(_trainer._data_loader_iter)
+        data_time = time.perf_counter() - start
+
+        # Zero grads once per accumulation cycle
+        _trainer.optimizer.zero_grad()
+
+        # Accumulate gradients over ga_steps micro-batches
+        total_loss_dict = None
+        for _micro_step in range(ga_steps):
+            with torch.cuda.amp.autocast():
+                loss_dict = _trainer.model(data)
+            if isinstance(loss_dict, torch.Tensor):
+                losses = loss_dict
+                loss_dict_for_log = {"total_loss": loss_dict.detach()}
+            else:
+                losses = sum(loss_dict.values())
+                loss_dict_for_log = {k: v.detach() for k, v in loss_dict.items()}
+
+            # Scale loss so sum of ga_steps gradients = average of micro-batches
+            losses = losses / ga_steps
+            self._amp_scaler.scale(losses).backward()
+
+            # Accumulate loss tensors for logging (detached)
+            if total_loss_dict is None:
+                total_loss_dict = {}
+                for k, v in loss_dict_for_log.items():
+                    total_loss_dict[k] = v.clone()
+            else:
+                for k, v in loss_dict_for_log.items():
+                    total_loss_dict[k] += v
+
+            # Fetch next batch for next micro-step (except last)
+            if _micro_step < ga_steps - 1:
+                data = next(_trainer._data_loader_iter)
+
+        # Average accumulated loss values for logging
+        if total_loss_dict is not None:
+            total_loss_dict = {k: v / ga_steps for k, v in total_loss_dict.items()}
+
+        _trainer.after_backward()
+        _trainer._write_metrics(total_loss_dict, data_time)
+        self._amp_scaler.step(_trainer.optimizer)
+        self._amp_scaler.update()
 
     def train_loop(self, start_iter: int, max_iter: int):
         """
