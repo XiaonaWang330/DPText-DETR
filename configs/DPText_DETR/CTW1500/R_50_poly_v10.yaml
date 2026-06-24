@@ -8,8 +8,10 @@ MODEL:
   WEIGHTS: "pretrain.pth"
   GA_STEPS: 4
   TRANSFORMER:
-    USE_CLIP_LANG_PRIOR: True  # V10: FiLM language prior + 8 prompts + SPP prompt_offset
-    CLIP_MODEL_PATH: "pretrain/clip-vit-base-patch16"
+    USE_CLIP_LANG_PRIOR: False  # V10: no CLIP, pure uncertainty regression
+    LOSS:
+      POINT_COORD_WEIGHT: 5.0  # V10: L1 regression (same as baseline)
+      POINT_VAR_WEIGHT: 0.5    # V10: auxiliary uncertainty MSE weight
 
 SOLVER:
   IMS_PER_BATCH: 2

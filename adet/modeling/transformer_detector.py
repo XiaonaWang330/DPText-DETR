@@ -142,7 +142,7 @@ class TransformerPureDetector(nn.Module):
             dec_losses,
             self.dptext_detr.num_ctrl_points,
             focal_alpha=loss_cfg.FOCAL_ALPHA,
-            focal_gamma=loss_cfg.FOCAL_GAMMA
+            focal_gamma=loss_cfg.FOCAL_GAMMA,
         )
 
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
@@ -197,6 +197,7 @@ class TransformerPureDetector(nn.Module):
             output = self.dptext_detr(images)
             ctrl_point_cls = output["pred_logits"]
             ctrl_point_coord = output["pred_ctrl_points"]
+
             results = self.inference(ctrl_point_cls, ctrl_point_coord, images.image_sizes)
             processed_results = []
             for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):

@@ -14,6 +14,7 @@ from torch import nn
 from torch.nn.init import normal_
 from adet.utils.misc import inverse_sigmoid
 from adet.modeling.dptext_detr.utils import MLP, gen_point_pos_embed
+from adet.modeling.dptext_detr.sgifa import SelfGuidedInstanceFeatureAggregation
 from .ms_deform_attn import MSDeformAttn
 from timm.models.layers import DropPath
 
@@ -36,7 +37,8 @@ class DeformableTransformer_Det(nn.Module):
             num_ctrl_points=16,
             epqm=False,
             efsa=False,
-            use_clip_lang_prior=False
+            use_clip_lang_prior=False,
+            enhance=False,
     ):
         super().__init__()
 
@@ -71,7 +73,8 @@ class DeformableTransformer_Det(nn.Module):
             num_decoder_layers,
             return_intermediate_dec,
             d_model,
-            epqm
+            epqm,
+            enhance
         )
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
@@ -520,7 +523,8 @@ class DeformableTransformerDecoder_Det(nn.Module):
             num_layers,
             return_intermediate=False,
             d_model=256,
-            epqm=False
+            epqm=False,
+            enhance=False,
     ):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -531,8 +535,16 @@ class DeformableTransformerDecoder_Det(nn.Module):
         self.class_embed = None
         self.ctrl_point_coord = None
         self.epqm = epqm
+        self.enhance = enhance
         if epqm:
             self.ref_point_head = MLP(d_model, d_model, d_model, 2)
+        # SGIFA: Self-Guided Instance Feature Aggregation
+        if enhance:
+            self.sgifa = SelfGuidedInstanceFeatureAggregation(
+                d_model=d_model,
+                num_levels=4,
+                use_uncertainty_gate=True,
+            )
 
     def forward(
             self,
@@ -592,6 +604,13 @@ class DeformableTransformerDecoder_Det(nn.Module):
                 tmp += inverse_sigmoid(reference_points)
                 tmp = tmp.sigmoid()
                 reference_points = tmp.detach()
+
+            # SGIFA: self-guided instance feature aggregation
+            # Skip layer 0 — ctrl_points are too coarse to provide useful ROI
+            if self.enhance and lid >= 1:
+                output = self.sgifa(
+                    output, reference_points, src, src_spatial_shapes, lid=lid
+                )
 
             if self.return_intermediate:
                 intermediate.append(output)

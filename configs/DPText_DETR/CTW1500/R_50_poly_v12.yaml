@@ -8,8 +8,11 @@ MODEL:
   WEIGHTS: "pretrain.pth"
   GA_STEPS: 4
   TRANSFORMER:
-    USE_CLIP_LANG_PRIOR: True  # V12: V9 sigmoid gate (Precision) + encoder saliency guidance (Recall)
-    CLIP_MODEL_PATH: "pretrain/clip-vit-base-patch16"
+    USE_CLIP_LANG_PRIOR: False
+    SGIFA:
+      ENABLED: True
+      USE_UNC_GATE: True
+      SKIP_FIRST: True
 
 SOLVER:
   IMS_PER_BATCH: 2

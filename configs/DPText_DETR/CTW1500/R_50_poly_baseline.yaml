@@ -8,7 +8,7 @@ MODEL:
   WEIGHTS: "pretrain.pth"  # official pre-trained model
   GA_STEPS: 4  # gradient accumulation, effective batch = IMS_PER_BATCH * GA_STEPS = 8
   TRANSFORMER:
-    USE_SOH: False  # pure baseline, no SOH
+    USE_CLIP_LANG_PRIOR: False  # pure baseline, no CLIP
 
 SOLVER:
   IMS_PER_BATCH: 2

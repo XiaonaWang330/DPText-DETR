@@ -342,6 +342,20 @@ _C.MODEL.TRANSFORMER = CN()
 _C.MODEL.TRANSFORMER.USE_POLYGON = False
 _C.MODEL.TRANSFORMER.ENABLED = True
 _C.MODEL.TRANSFORMER.INFERENCE_TH_TEST = 0.3
+# V11: dual-path uncertainty (disabled by default, set in per-experiment configs)
+_C.MODEL.TRANSFORMER.INFERENCE_CLS_UNC_WEIGHT = 0.0   # w_cls: 0 = off
+_C.MODEL.TRANSFORMER.INFERENCE_REG_UNC_WEIGHT = 0.0   # w_reg: 0 = off
+_C.MODEL.TRANSFORMER.INFERENCE_UNC_TEMP = 1.0
+_C.MODEL.TRANSFORMER.INFERENCE_AUX_ENSEMBLE = False
+
+# --------------------------------------------------------------------------- #
+# V12: Self-Guided Instance Feature Aggregation (SGIFA)
+# --------------------------------------------------------------------------- #
+_C.MODEL.TRANSFORMER.SGIFA = CN()
+_C.MODEL.TRANSFORMER.SGIFA.ENABLED = False
+_C.MODEL.TRANSFORMER.SGIFA.USE_UNC_GATE = True  # uncertainty-modulated gating
+_C.MODEL.TRANSFORMER.SGIFA.SKIP_FIRST = True    # skip first decoder layer (ctrl too coarse)
+
 _C.MODEL.TRANSFORMER.VOC_SIZE = 96
 _C.MODEL.TRANSFORMER.NUM_CHARS = 25
 _C.MODEL.TRANSFORMER.AUX_LOSS = True
@@ -374,6 +388,11 @@ _C.MODEL.TRANSFORMER.LOSS.BOX_COORD_WEIGHT = 5.0
 _C.MODEL.TRANSFORMER.LOSS.BOX_GIOU_WEIGHT = 2.0
 _C.MODEL.TRANSFORMER.LOSS.FOCAL_ALPHA = 0.25
 _C.MODEL.TRANSFORMER.LOSS.FOCAL_GAMMA = 2.0
+_C.MODEL.TRANSFORMER.LOSS.POINT_VAR_WEIGHT = 0.0  # V10: regression uncertainty (0 = off, enable in config)
+_C.MODEL.TRANSFORMER.LOSS.CLS_VAR_WEIGHT = 0.0    # V11: classification uncertainty (0 = off)
+_C.MODEL.TRANSFORMER.LOSS.REG_VAR_NEG_WEIGHT = 0.0  # V11: negative-sample reg uncertainty (0 = off)
+_C.MODEL.TRANSFORMER.LOSS.REG_VAR_NEG_TARGET = 0.0  # V11: negative-sample reg log_var target
+_C.MODEL.TRANSFORMER.LOSS.AUX_ENSEMBLE_LAYERS = 3   # V11: aux ensemble layers
 
 
 _C.SOLVER.OPTIMIZER = "ADAMW"

@@ -35,6 +35,7 @@ class DPText_DETR(nn.Module):
         self.epqm = cfg.MODEL.TRANSFORMER.EPQM
         self.efsa = cfg.MODEL.TRANSFORMER.EFSA
         self.use_clip_lang_prior = cfg.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR
+        self.enhance = cfg.MODEL.TRANSFORMER.SGIFA.ENABLED
         self.ctrl_point_embed = nn.Embedding(self.num_ctrl_points, self.d_model)
 
         # V9: CLIP language prior with per-layer sigmoid gate
@@ -62,7 +63,8 @@ class DPText_DETR(nn.Module):
             num_ctrl_points=self.num_ctrl_points,
             epqm=self.epqm,
             efsa=self.efsa,
-            use_clip_lang_prior=self.use_clip_lang_prior
+            use_clip_lang_prior=self.use_clip_lang_prior,
+            enhance=self.enhance,
         )
         self.ctrl_point_class = nn.Linear(self.d_model, self.num_classes)
         self.ctrl_point_coord = MLP(self.d_model, self.d_model, 2, 3)
@@ -216,5 +218,6 @@ class DPText_DETR(nn.Module):
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         return [
-            {'pred_logits': a, 'pred_ctrl_points': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
+            {'pred_logits': a, 'pred_ctrl_points': b}
+            for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
         ]

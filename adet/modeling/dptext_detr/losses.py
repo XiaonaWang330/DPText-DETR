@@ -51,7 +51,7 @@ class SetCriterion(nn.Module):
             dec_losses,
             num_ctrl_points,
             focal_alpha=0.25,
-            focal_gamma=2.0
+            focal_gamma=2.0,
     ):
         """ Create the criterion.
         Parameters:
@@ -149,9 +149,10 @@ class SetCriterion(nn.Module):
         src_ctrl_points = outputs['pred_ctrl_points'][idx]
         target_ctrl_points = torch.cat([t['ctrl_points'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-        loss_ctrl_points = F.l1_loss(src_ctrl_points, target_ctrl_points, reduction='sum')
+        # Main loss: L1
+        loss_ctrl_points = F.l1_loss(src_ctrl_points, target_ctrl_points, reduction='sum') / num_inst
+        losses = {'loss_ctrl_points': loss_ctrl_points}
 
-        losses = {'loss_ctrl_points': loss_ctrl_points / num_inst}
         return losses
 
     @staticmethod
