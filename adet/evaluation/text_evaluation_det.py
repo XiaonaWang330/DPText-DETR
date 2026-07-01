@@ -100,7 +100,6 @@ class TextDetEvaluator(DatasetEvaluator):
                             outstr = outstr + str(int(data[ix]['polys'][i][0])) +','+str(int(data[ix]['polys'][i][1])) +','
                         outstr = outstr + str(round(data[ix]['score'], 3)) + ',' + '####' + '\n'
                         f2.writelines(outstr)
-                f2.close()
         dirn = temp_dir
         fres = open('temp_all_det_cors.txt', 'r').readlines()
         if not os.path.isdir(dirn):

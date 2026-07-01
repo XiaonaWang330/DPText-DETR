@@ -52,6 +52,10 @@ class SetCriterion(nn.Module):
             num_ctrl_points,
             focal_alpha=0.25,
             focal_gamma=2.0,
+            sfa_module=None,
+            bg_margin=0.1,
+            bg_weight=0.1,
+            sfa_hnm_weight=0.0,
     ):
         """ Create the criterion.
         Parameters:
@@ -60,6 +64,11 @@ class SetCriterion(nn.Module):
             - weight_dict: dict containing as key the names of the losses and as values their relative weight.
             - losses: list of all the losses to be applied. See get_loss for list of available losses.
             - focal_alpha: alpha in Focal Loss
+            - focal_gamma: gamma in Focal Loss
+            - sfa_module: optional SemanticFeatureAlignment for alignment loss
+            - bg_margin: V22: hinge margin for bg contrastive (push bg cos_sim < margin)
+            - bg_weight: V22: relative weight of bg contrastive loss
+            - sfa_hnm_weight: V23: semantic hard negative mining (0=off for V22)
         """
         super().__init__()
         self.num_classes = num_classes
@@ -71,6 +80,10 @@ class SetCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.num_ctrl_points = num_ctrl_points
+        self.sfa_module = sfa_module
+        self.bg_margin = bg_margin
+        self.bg_weight = bg_weight
+        self.sfa_hnm_weight = sfa_hnm_weight
 
     def loss_labels(self, outputs, targets, indices, num_inst, log=False):
         """Classification loss (NLL)
@@ -162,6 +175,30 @@ class SetCriterion(nn.Module):
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
+    def loss_sfa_align(self, outputs, targets, indices, num_inst):
+        """Semantic Feature Alignment loss: positive pull + background contrastive push."""
+        if self.sfa_module is None:
+            return {'loss_sfa_align': torch.tensor(0.0, device=outputs['pred_logits'].device)}
+
+        sfa_info = outputs.get('sfa_info')
+        if sfa_info is None:
+            return {'loss_sfa_align': torch.tensor(0.0, device=outputs['pred_logits'].device)}
+
+        feat_proj = sfa_info['feat_proj']   # (B, N, 16, D)
+        c_text = sfa_info['c_text']          # (D,)
+        pos_idx = self._get_src_permutation_idx(indices)
+
+        # V22: construct background mask (unmatched queries)
+        B, N = feat_proj.shape[:2]
+        neg_mask = torch.ones(B, N, dtype=torch.bool, device=feat_proj.device)
+        neg_mask[pos_idx[0], pos_idx[1]] = False  # matched queries are NOT background
+
+        loss = self.sfa_module.compute_alignment_loss(
+            feat_proj, c_text, pos_idx, neg_mask, num_inst,
+            bg_margin=self.bg_margin, bg_weight=self.bg_weight,
+        )
+        return {'loss_sfa_align': loss}
+
     @staticmethod
     def _get_tgt_permutation_idx(indices):
         # permute targets following indices
@@ -175,6 +212,7 @@ class SetCriterion(nn.Module):
             'cardinality': self.loss_cardinality,
             'ctrl_points': self.loss_ctrl_points,
             'boxes': self.loss_boxes,
+            'sfa_align': self.loss_sfa_align,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_inst, **kwargs)

@@ -53,6 +53,41 @@ from adet.checkpoint import AdetCheckpointer
 from adet.evaluation import TextEvaluator,TextDetEvaluator
 
 
+class EvalPeriodFinalCheckpointer(hooks.HookBase):
+    """
+    Save ``model_final_<iter>.pth`` after each evaluation period.
+    Only the latest checkpoint is kept (previous one is deleted).
+
+    This replaces the noisy ``model_0000999.pth`` periodic checkpoints
+    with a single well-named snapshot that updates every eval period.
+    """
+
+    def __init__(self, eval_period: int, checkpointer, max_iter: int):
+        self._period = eval_period
+        self._checkpointer = checkpointer
+        self._max_iter = max_iter
+        self._prev_path = None
+        self._logger = logging.getLogger(__name__)
+
+    def after_step(self):
+        next_iter = self.trainer.iter + 1
+        if self._period > 0 and next_iter % self._period == 0 and next_iter != self._max_iter:
+            # Delete previous final checkpoint
+            if self._prev_path and os.path.exists(self._prev_path):
+                os.remove(self._prev_path)
+
+            name = f"model_final_{next_iter}"
+            self._checkpointer.save(name, iteration=next_iter)
+            self._prev_path = os.path.join(self._checkpointer.save_dir, f"{name}.pth")
+
+    def after_train(self):
+        # Delete the intermediate final, save the true final
+        if self._prev_path and os.path.exists(self._prev_path):
+            os.remove(self._prev_path)
+        name = f"model_final_{self.trainer.iter}"
+        self._checkpointer.save(name, iteration=self.trainer.iter)
+
+
 class Trainer(DefaultTrainer):
     """
     This is the same Trainer except that we rewrite the
@@ -62,11 +97,13 @@ class Trainer(DefaultTrainer):
         """
         Replace `DetectionCheckpointer` with `AdetCheckpointer`.
         Add `BestCheckpointer` to save best model based on hmean (F1).
+        Add `EvalPeriodFinalCheckpointer` to save final_<iter> after each eval.
 
         Hook execution order in after_step():
-          - PeriodicCheckpointer  -> save "last" checkpoint (for resume)
-          - EvalHook              -> run evaluation, store metrics in storage
-          - BestCheckpointer      -> save "best" checkpoint if hmean improved
+          - PeriodicCheckpointer       -> save "model_final" at end only (periodic saves disabled)
+          - EvalHook                   -> run evaluation, store metrics in storage
+          - BestCheckpointer           -> save "model_best" if hmean improved
+          - EvalPeriodFinalCheckpointer -> save "model_final_<iter>" (latest only)
         """
         ret = super().build_hooks()
         for i in range(len(ret)):
@@ -77,8 +114,10 @@ class Trainer(DefaultTrainer):
                     optimizer=self.optimizer,
                     scheduler=self.scheduler,
                 )
+                # Disable periodic saves (period > max_iter) — only keep
+                # the end-of-training "model_final" save for backward compat.
                 ret[i] = hooks.PeriodicCheckpointer(
-                    self.checkpointer, self.cfg.SOLVER.CHECKPOINT_PERIOD,
+                    self.checkpointer, self.max_iter + 1,
                     max_iter=self.max_iter
                 )
             elif isinstance(ret[i], hooks.EvalHook):
@@ -89,6 +128,12 @@ class Trainer(DefaultTrainer):
                     val_metric="DET_RESULT/hmean",
                     mode="max",
                     file_prefix="model_best",
+                ))
+                # Insert EvalPeriodFinalCheckpointer after BestCheckpointer
+                ret.insert(i + 2, EvalPeriodFinalCheckpointer(
+                    eval_period=self.cfg.TEST.EVAL_PERIOD,
+                    checkpointer=self.checkpointer,
+                    max_iter=self.max_iter,
                 ))
         return ret
     

@@ -6,6 +6,7 @@ from adet.layers.deformable_transformer import DeformableTransformer_Det
 from adet.utils.misc import NestedTensor, inverse_sigmoid_offset, nested_tensor_from_tensor_list, sigmoid_offset
 from .utils import MLP
 from .clip_language_prior import CLIPLanguagePrior
+from .semantic_feature_alignment import SemanticFeatureAlignment
 
 
 class DPText_DETR(nn.Module):
@@ -45,6 +46,17 @@ class DPText_DETR(nn.Module):
                 d_model=self.d_model,
                 num_ctrl_points=self.num_ctrl_points,
                 clip_model_path=clip_model_path if clip_model_path else None,
+            )
+
+        # V13: Semantic Feature Alignment (Phase A — inference confidence fusion)
+        self.use_sfa = cfg.MODEL.TRANSFORMER.get("USE_SFA", False)
+        if self.use_sfa:
+            sfa_clip_path = cfg.MODEL.TRANSFORMER.get("CLIP_MODEL_PATH", "")
+            sfa_agg_mode = cfg.MODEL.TRANSFORMER.get("SFA_AGG_MODE", "point")
+            self.sfa = SemanticFeatureAlignment(
+                d_model=self.d_model,
+                clip_model_path=sfa_clip_path if sfa_clip_path else None,
+                agg_mode=sfa_agg_mode,
             )
 
         self.transformer = DeformableTransformer_Det(
@@ -170,9 +182,16 @@ class DPText_DETR(nn.Module):
         if self.use_clip_lang_prior:
             c_lang, v_spatial = self.clip_lang_prior(srcs[-2], srcs[-1])
 
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, dec_unc = self.transformer(
             srcs, masks, pos, ctrl_point_embed, c_lang=c_lang, v_spatial=v_spatial
         )
+
+        # V15: SFA — semantic alignment on last decoder layer output
+        # semantic_logit: (B,N,16,1) injected into cls_logit for training
+        # V18: dec_unc (B,N,1) — SGIFA uncertainty gates SFA per-query
+        sem_cos, sfa_info, semantic_logit = None, None, None
+        if self.use_sfa:
+            semantic_logit, sem_cos, sfa_info = self.sfa(hs[-1], unc=dec_unc)  # hs[-1]: (B, N, 16, 256)
 
         outputs_classes = []
         outputs_coords = []
@@ -183,6 +202,9 @@ class DPText_DETR(nn.Module):
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid_offset(reference, offset=self.sigmoid_offset)
             outputs_class = self.ctrl_point_class[lvl](hs[lvl])
+            # V15: inject semantic logit into last decoder layer classification
+            if self.use_sfa and lvl == hs.shape[0] - 1 and semantic_logit is not None:
+                outputs_class = outputs_class + semantic_logit  # (B,N,16,1) + (B,N,16,1)
             tmp = self.ctrl_point_coord[lvl](hs[lvl])
             if reference.shape[-1] == 2:
                 if self.epqm:
@@ -203,6 +225,11 @@ class DPText_DETR(nn.Module):
         outputs_coord = torch.stack(outputs_coords)
 
         out = {'pred_logits': outputs_class[-1], 'pred_ctrl_points': outputs_coord[-1]}
+
+        # V13: attach SFA outputs for loss computation and inference fusion
+        if self.use_sfa and sfa_info is not None:
+            out['sfa_info'] = sfa_info
+            out['sem_cos'] = sem_cos  # (B, N, 16) for inference
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)

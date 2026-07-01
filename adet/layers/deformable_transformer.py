@@ -14,7 +14,10 @@ from torch import nn
 from torch.nn.init import normal_
 from adet.utils.misc import inverse_sigmoid
 from adet.modeling.dptext_detr.utils import MLP, gen_point_pos_embed
-from adet.modeling.dptext_detr.sgifa import SelfGuidedInstanceFeatureAggregation
+try:
+    from adet.modeling.dptext_detr.sgifa import SelfGuidedInstanceFeatureAggregation
+except ImportError:
+    SelfGuidedInstanceFeatureAggregation = None
 from .ms_deform_attn import MSDeformAttn
 from timm.models.layers import DropPath
 
@@ -39,6 +42,7 @@ class DeformableTransformer_Det(nn.Module):
             efsa=False,
             use_clip_lang_prior=False,
             enhance=False,
+            lang_concept=None,
     ):
         super().__init__()
 
@@ -74,7 +78,8 @@ class DeformableTransformer_Det(nn.Module):
             return_intermediate_dec,
             d_model,
             epqm,
-            enhance
+            enhance,
+            lang_concept,
         )
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
@@ -232,7 +237,7 @@ class DeformableTransformer_Det(nn.Module):
         # learnable control point content queries
         query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1, -1)
 
-        hs, inter_references = self.decoder(
+        hs, inter_references, dec_unc = self.decoder(
             query_embed,
             reference_points,
             memory,
@@ -246,7 +251,7 @@ class DeformableTransformer_Det(nn.Module):
         )
         inter_references_out = inter_references
 
-        return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
+        return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, dec_unc
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -525,6 +530,7 @@ class DeformableTransformerDecoder_Det(nn.Module):
             d_model=256,
             epqm=False,
             enhance=False,
+            lang_concept=None,
     ):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -540,11 +546,18 @@ class DeformableTransformerDecoder_Det(nn.Module):
             self.ref_point_head = MLP(d_model, d_model, d_model, 2)
         # SGIFA: Self-Guided Instance Feature Aggregation
         if enhance:
+            if SelfGuidedInstanceFeatureAggregation is None:
+                raise ImportError(
+                    "SGIFA.ENABLED=True but sgifa.py is missing. "
+                    "Upload adet/modeling/dptext_detr/sgifa.py to the server."
+                )
             self.sgifa = SelfGuidedInstanceFeatureAggregation(
                 d_model=d_model,
                 num_levels=4,
                 use_uncertainty_gate=True,
             )
+        # V16: Language-Guided Multi-Concept (Phase B)
+        self.lang_concept = lang_concept
 
     def forward(
             self,
@@ -566,6 +579,7 @@ class DeformableTransformerDecoder_Det(nn.Module):
 
         intermediate = []
         intermediate_reference_points = []
+        dec_unc = None  # V18: SGIFA uncertainty for SFA (last valid layer)
         for lid, layer in enumerate(self.layers):
             if reference_points.shape[-1] == 4:
                 reference_points_input = reference_points[:, :, None] \
@@ -608,18 +622,29 @@ class DeformableTransformerDecoder_Det(nn.Module):
             # SGIFA: self-guided instance feature aggregation
             # Skip layer 0 — ctrl_points are too coarse to provide useful ROI
             if self.enhance and lid >= 1:
-                output = self.sgifa(
-                    output, reference_points, src, src_spatial_shapes, lid=lid
+                result = self.sgifa(
+                    output, reference_points, src, src_spatial_shapes, lid=lid,
+                    return_unc=True  # V18: route SGIFA unc → SFA
                 )
+                if isinstance(result, tuple):
+                    output, dec_unc = result  # dec_unc: (B, N, 1) per-query uncertainty
+                else:
+                    output = result
+
+            # V16: Language-Guided Multi-Concept (Phase B) — per-query concept routing
+            # Applied to ALL layers (0~5), after SGIFA.
+            # cold start: modulation_gate init=-5 → sigmoid≈0.007 ≈ identity
+            if self.lang_concept is not None:
+                output = self.lang_concept(output)
 
             if self.return_intermediate:
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
 
         if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(intermediate_reference_points)
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points), dec_unc
 
-        return output, reference_points
+        return output, reference_points, dec_unc
 
 
 def _get_clones(module, N):

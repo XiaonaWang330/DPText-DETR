@@ -81,7 +81,7 @@ class SelfGuidedInstanceFeatureAggregation(nn.Module):
             nn.init.constant_(self.unc_head[-1].weight, 0)
             nn.init.constant_(self.unc_head[-1].bias, 0)
 
-    def forward(self, hs, ref_points, memory, spatial_shapes, lid=-1):
+    def forward(self, hs, ref_points, memory, spatial_shapes, lid=-1, return_unc=False):
         """
         Args:
             hs (Tensor): (B, N, 16, D) — decoder hidden state at current layer
@@ -89,9 +89,11 @@ class SelfGuidedInstanceFeatureAggregation(nn.Module):
             memory (Tensor): (Sum(HW), B, D) — flattened multi-scale encoder features
             spatial_shapes (Tensor): (L, 2) — (H, W) per feature level
             lid (int): layer index (unused, kept for API compatibility)
+            return_unc (bool): if True, return (hs_out, unc) tuple; else hs_out only
 
         Returns:
             hs_enhanced (Tensor): (B, N, 16, D) — enhanced hidden state
+            OR (hs_enhanced, unc) tuple if return_unc=True
         """
         B, N, P, D = hs.shape
         L = spatial_shapes.shape[0]
@@ -139,6 +141,7 @@ class SelfGuidedInstanceFeatureAggregation(nn.Module):
         gate = self.gate_net(hs.mean(dim=2)).sigmoid()  # (B, N, 1)
 
         # --- Step 4: Optional uncertainty-modulated gating ---
+        unc = None
         if self.use_uncertainty_gate:
             unc = self.unc_head(hs.detach().mean(dim=2)).sigmoid()  # (B, N, 1)
             gate = gate * (0.5 + 0.5 * unc)  # scale to [0.25, 0.75] × base gate
@@ -148,6 +151,9 @@ class SelfGuidedInstanceFeatureAggregation(nn.Module):
         # enhanced: (B, N, D) → unsqueeze to (B, N, 1, D)
         hs_out = hs + gate.unsqueeze(2) * enhanced.unsqueeze(2)  # (B, N, P, D)
 
+        if return_unc:
+            # unc: (B, N, 1) — per-query uncertainty, None if use_uncertainty_gate=False
+            return hs_out, unc
         return hs_out
 
 

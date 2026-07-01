@@ -377,6 +377,8 @@ _C.MODEL.TRANSFORMER.EFSA = False
 
 _C.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR = False  # V9: CLIP language prior with image-adaptive prompts
 _C.MODEL.TRANSFORMER.CLIP_MODEL_PATH = ""  # V9: local path to CLIP weights (empty = use HF hub)
+_C.MODEL.TRANSFORMER.USE_SFA = False  # V13: Semantic Feature Alignment
+_C.MODEL.TRANSFORMER.SFA_AGG_MODE = "point"  # V21/V22: "point"=per-point, "max"=per-query max, "mean"=per-query mean
 
 
 _C.MODEL.TRANSFORMER.LOSS = CN()
@@ -392,6 +394,9 @@ _C.MODEL.TRANSFORMER.LOSS.POINT_VAR_WEIGHT = 0.0  # V10: regression uncertainty 
 _C.MODEL.TRANSFORMER.LOSS.CLS_VAR_WEIGHT = 0.0    # V11: classification uncertainty (0 = off)
 _C.MODEL.TRANSFORMER.LOSS.REG_VAR_NEG_WEIGHT = 0.0  # V11: negative-sample reg uncertainty (0 = off)
 _C.MODEL.TRANSFORMER.LOSS.REG_VAR_NEG_TARGET = 0.0  # V11: negative-sample reg log_var target
+_C.MODEL.TRANSFORMER.LOSS.SFA_ALIGN_WEIGHT = 0.5    # V15: SFA alignment loss weight
+_C.MODEL.TRANSFORMER.LOSS.SFA_BG_MARGIN = 0.1       # V22: hinge margin for bg contrastive (push bg cos_sim < margin)
+_C.MODEL.TRANSFORMER.LOSS.SFA_ALIGN_BG_WEIGHT = 0.1 # V22: bg contrastive loss weight
 _C.MODEL.TRANSFORMER.LOSS.AUX_ENSEMBLE_LAYERS = 3   # V11: aux ensemble layers
 
 

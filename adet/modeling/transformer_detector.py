@@ -133,6 +133,11 @@ class TransformerPureDetector(nn.Module):
         enc_losses = ['labels', 'boxes']
         dec_losses = ['labels', 'ctrl_points']
 
+        # V13: SFA alignment loss
+        if self.dptext_detr.use_sfa:
+            dec_losses.append('sfa_align')
+            weight_dict['loss_sfa_align'] = loss_cfg.get('SFA_ALIGN_WEIGHT', 0.5)
+
         self.criterion = SetCriterion(
             self.dptext_detr.num_classes,
             box_matcher,
@@ -143,6 +148,10 @@ class TransformerPureDetector(nn.Module):
             self.dptext_detr.num_ctrl_points,
             focal_alpha=loss_cfg.FOCAL_ALPHA,
             focal_gamma=loss_cfg.FOCAL_GAMMA,
+            sfa_module=self.dptext_detr.sfa if self.dptext_detr.use_sfa else None,
+            bg_margin=loss_cfg.get('SFA_BG_MARGIN', 0.1),
+            bg_weight=loss_cfg.get('SFA_ALIGN_BG_WEIGHT', 0.1),
+            sfa_hnm_weight=loss_cfg.get('SFA_HNM_WEIGHT', 0.0),
         )
 
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
@@ -197,8 +206,9 @@ class TransformerPureDetector(nn.Module):
             output = self.dptext_detr(images)
             ctrl_point_cls = output["pred_logits"]
             ctrl_point_coord = output["pred_ctrl_points"]
+            sem_cos = output.get("sem_cos", None)
 
-            results = self.inference(ctrl_point_cls, ctrl_point_coord, images.image_sizes)
+            results = self.inference(ctrl_point_cls, ctrl_point_coord, images.image_sizes, sem_cos=sem_cos)
             processed_results = []
             for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
                 height = input_per_image.get("height", image_size[0])
@@ -224,12 +234,12 @@ class TransformerPureDetector(nn.Module):
             )
         return new_targets
 
-    def inference(self, ctrl_point_cls, ctrl_point_coord, image_sizes):
+    def inference(self, ctrl_point_cls, ctrl_point_coord, image_sizes, sem_cos=None):
         assert len(ctrl_point_cls) == len(image_sizes)
         results = []
 
-        prob = ctrl_point_cls.mean(-2).sigmoid()
-        scores, labels = prob.max(-1)
+        prob = ctrl_point_cls.mean(-2).sigmoid()  # (B, N, 1)
+        scores, labels = prob.max(-1)  # V15: semantic signal baked into cls_logit via training injection
 
         for scores_per_image, labels_per_image, ctrl_point_per_image, image_size in zip(
                 scores, labels, ctrl_point_coord, image_sizes

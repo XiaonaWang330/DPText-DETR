@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Compiled extensions
+*.pyd
+*.so
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Pretrained models / checkpoints (large files)
+pretrain.pth
+ctw1500_final.pth
+totaltext_final.pth
+*.pth
+
+# CLIP pretrained weights
+pretrain/
+
+# Output directories
+output/
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.v22_backup
