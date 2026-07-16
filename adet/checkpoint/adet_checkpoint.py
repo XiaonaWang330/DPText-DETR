@@ -54,13 +54,20 @@ class AdetCheckpointer(DetectionCheckpointer):
                     model_state[key] = checkpoint["model"][key]
             missing, unexpected = self.model.load_state_dict(model_state, strict=False)
         else:
+            checkpoint_model = checkpoint["model"]
             missing, unexpected = self.model.load_state_dict(
-                checkpoint["model"], strict=False
+                checkpoint_model, strict=False
             )
 
         # Only warn about non-CLIP missing keys (CLIP frozen weights reload from HF)
-        real_missing = [k for k in missing if "clip_text_model." not in k]
-        real_unexpected = [k for k in unexpected if "clip_text_model." not in k]
+        def _is_clip_param(key):
+            return (
+                "clip_text_model." in key   # SFA, CLIP Language Prior
+                or "clip_vision." in key     # CMFE, CSG
+                or "clip_text." in key       # CMFE, CSG
+            )
+        real_missing = [k for k in missing if not _is_clip_param(k)]
+        real_unexpected = [k for k in unexpected if not _is_clip_param(k)]
         if real_missing:
             self.logger.warning(f"Missing keys: {real_missing}")
         if real_unexpected:
@@ -68,13 +75,17 @@ class AdetCheckpointer(DetectionCheckpointer):
 
     def save(self, name: str, **kwargs):
         """
-        Save checkpoint, excluding CLIP frozen weights (~252MB).
+        Save checkpoint, excluding CLIP frozen weights (~600MB for ViT+Text).
         They are reloaded from huggingface on next init.
         """
         data = {}
         data["model"] = OrderedDict(
             (k, v) for k, v in self.model.state_dict().items()
-            if "clip_text_model." not in k
+            if not (
+                "clip_text_model." in k   # SFA, CLIP Language Prior
+                or "clip_vision." in k     # CMFE, CSG
+                or "clip_text." in k       # CMFE, CSG (distinct from clip_text_model.)
+            )
         )
         for key, obj in kwargs.items():
             data[key] = obj

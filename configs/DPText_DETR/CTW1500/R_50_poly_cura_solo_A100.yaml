@@ -1,20 +1,22 @@
 _BASE_: "../Base.yaml"
 
+SEED: 42
+
 DATASETS:
   TRAIN: ("ctw1500_poly_train_rotate_pos",)
   TEST: ("ctw1500_poly_test",)
 
 MODEL:
   WEIGHTS: "pretrain.pth"
-  GA_STEPS: 4
+  GA_STEPS: 1
   TRANSFORMER:
-    USE_CLIP_LANG_PRIOR: False  # V10: no CLIP, pure uncertainty regression
-    LOSS:
-      POINT_COORD_WEIGHT: 5.0  # V10: L1 regression (same as baseline)
-      POINT_VAR_WEIGHT: 0.5    # V10: auxiliary uncertainty MSE weight
+    USE_CLIP_LANG_PRIOR: False
+    USE_LAIR: False
+    USE_SATR: True
+    SATR_USE_CURA: True
 
 SOLVER:
-  IMS_PER_BATCH: 2
+  IMS_PER_BATCH: 8
   BASE_LR: 2e-5
   LR_BACKBONE: 2e-6
   WARMUP_ITERS: 0
@@ -29,4 +31,7 @@ INPUT:
 TEST:
   EVAL_PERIOD: 1000
 
-OUTPUT_DIR: "output/r_50_poly/ctw1500/V10"
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/cura_solo_A100"

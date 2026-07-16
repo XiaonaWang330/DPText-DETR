@@ -42,7 +42,7 @@ class DeformableTransformer_Det(nn.Module):
             efsa=False,
             use_clip_lang_prior=False,
             enhance=False,
-            lang_concept=None,
+            satr_module=None,
     ):
         super().__init__()
 
@@ -70,7 +70,8 @@ class DeformableTransformer_Det(nn.Module):
             nhead,
             dec_n_points,
             efsa,
-            use_clip_lang_prior=use_clip_lang_prior
+            use_clip_lang_prior=use_clip_lang_prior,
+            satr_module=satr_module,
         )
         self.decoder = DeformableTransformerDecoder_Det(
             decoder_layer,
@@ -79,7 +80,6 @@ class DeformableTransformer_Det(nn.Module):
             d_model,
             epqm,
             enhance,
-            lang_concept,
         )
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
@@ -213,6 +213,10 @@ class DeformableTransformer_Det(nn.Module):
             lvl_pos_embed_flatten,
             mask_flatten
         )
+
+        # V48: expose encoder memory + spatial_shapes for SFA v2 (encoder-level RoI pooling)
+        self.enc_memory = memory
+        self.enc_spatial_shapes = spatial_shapes
 
         # prepare input for decoder
         bs, _, c = memory.shape
@@ -374,12 +378,14 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
             n_heads=8,
             n_points=4,
             efsa=False,
-            use_clip_lang_prior=False
+            use_clip_lang_prior=False,
+            satr_module=None,
     ):
         super().__init__()
 
         self.efsa = efsa
         self.use_clip_lang_prior = use_clip_lang_prior
+        self.satr = satr_module
 
         # cross attention
         self.attn_cross = MSDeformAttn(d_model, n_levels, n_heads, n_points)
@@ -452,17 +458,45 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
         # - tgt:        (bs, n_q, n_pts, dim)
         # - query_pos:  (bs, n_q, n_pts, dim)
 
-        # intra-group self-attention
+        # =================================================================
+        # 1. intra-group self-attention (EFSA or standard)
+        # =================================================================
+        sigma = None  # SATR scale factor
+
         if self.efsa:
             shortcut = tgt
             q = k = self.with_pos_embed(tgt, query_pos)
-            tgt = self.attn_intra(
+            tgt_intra = self.attn_intra(
                 q.flatten(0, 1).transpose(0, 1),
                 k.flatten(0, 1).transpose(0, 1),
                 tgt.flatten(0, 1).transpose(0, 1),
             )[0].transpose(0, 1).reshape(q.shape)
-            tgt_circonv = self.drop_path(self.circonv(shortcut+query_pos))
-            tgt = shortcut + self.norm_intra(self.drop_path(tgt) + tgt_circonv)
+
+            tgt_circonv = self.drop_path(self.circonv(shortcut + query_pos))
+
+            # --- SATR / CURA: geometry refinement ---
+            film_scale = None
+            if self.satr is not None:
+                ref_pts = reference_points
+                if ref_pts.dim() == 5:
+                    ref_pts = ref_pts[:, :, :, 0, :]   # (B, N, 16, 2)
+                assert ref_pts.shape[:3] == shortcut.shape[:3], \
+                    (f"SATR shape mismatch: ref_pts{tuple(ref_pts.shape)} "
+                     f"vs shortcut{tuple(shortcut.shape)}. "
+                     f"reference_points{tuple(reference_points.shape)}")
+                gauss_feat, film_scale = self.satr(
+                    shortcut, ref_pts
+                )
+                tgt_intra = tgt_intra + gauss_feat
+
+            if self.satr is not None and film_scale is not None:
+                tgt_circonv = self.satr.forward_film_circonv(
+                    tgt_circonv, film_scale
+                )
+
+            tgt = shortcut + self.norm_intra(
+                self.drop_path(tgt_intra) + tgt_circonv
+            )
             tgt = tgt + self.drop_path(self.norm_fuse(self.mlp_fuse(tgt)))
         else:
             q = k = self.with_pos_embed(tgt, query_pos)
@@ -474,7 +508,9 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
             tgt = tgt + self.dropout_intra(tgt2)
             tgt = self.norm_intra(tgt)
 
-        # inter-group self-attention
+        # =================================================================
+        # 2. inter-group self-attention
+        # =================================================================
         q_inter = k_inter = tgt_inter = torch.swapdims(tgt, 1, 2)  # (bs, n_pts, n_q, dim)
         tgt2_inter = self.attn_inter(
             q_inter.flatten(0, 1).transpose(0, 1),
@@ -484,7 +520,9 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
         tgt_inter = tgt_inter + self.dropout_inter(tgt2_inter)
         tgt_inter = torch.swapdims(self.norm_inter(tgt_inter), 1, 2)
 
-        # cross attention
+        # =================================================================
+        # 3. cross attention
+        # =================================================================
         if len(reference_points.shape) == 4:
             reference_points_loc = reference_points[:, :, None, :, :].repeat(1, 1, tgt_inter.shape[2], 1, 1)
         else:
@@ -501,7 +539,9 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
         tgt_inter = tgt_inter + self.dropout_cross(tgt2)
         tgt = self.norm_cross(tgt_inter)
 
-        # ffn
+        # =================================================================
+        # 4. ffn
+        # =================================================================
         tgt = self.forward_ffn(tgt)
 
         # ---- V12: post-FFN sigmoid gate + spatial injection (V9 proven, targets Precision) ----
@@ -530,7 +570,6 @@ class DeformableTransformerDecoder_Det(nn.Module):
             d_model=256,
             epqm=False,
             enhance=False,
-            lang_concept=None,
     ):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -544,7 +583,7 @@ class DeformableTransformerDecoder_Det(nn.Module):
         self.enhance = enhance
         if epqm:
             self.ref_point_head = MLP(d_model, d_model, d_model, 2)
-        # SGIFA: Self-Guided Instance Feature Aggregation
+        # SGIFA: Self-Guided Instance Feature Aggregation (PWP)
         if enhance:
             if SelfGuidedInstanceFeatureAggregation is None:
                 raise ImportError(
@@ -556,8 +595,6 @@ class DeformableTransformerDecoder_Det(nn.Module):
                 num_levels=4,
                 use_uncertainty_gate=True,
             )
-        # V16: Language-Guided Multi-Concept (Phase B)
-        self.lang_concept = lang_concept
 
     def forward(
             self,
@@ -609,7 +646,7 @@ class DeformableTransformerDecoder_Det(nn.Module):
                 src_level_start_index,
                 src_padding_mask,
                 c_lang=c_lang,
-                v_spatial=v_spatial
+                v_spatial=v_spatial,
             )
 
             # update the reference points
@@ -630,12 +667,6 @@ class DeformableTransformerDecoder_Det(nn.Module):
                     output, dec_unc = result  # dec_unc: (B, N, 1) per-query uncertainty
                 else:
                     output = result
-
-            # V16: Language-Guided Multi-Concept (Phase B) — per-query concept routing
-            # Applied to ALL layers (0~5), after SGIFA.
-            # cold start: modulation_gate init=-5 → sigmoid≈0.007 ≈ identity
-            if self.lang_concept is not None:
-                output = self.lang_concept(output)
 
             if self.return_intermediate:
                 intermediate.append(output)

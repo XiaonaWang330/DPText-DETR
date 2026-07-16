@@ -89,9 +89,13 @@ class TextDetEvaluator(DatasetEvaluator):
             poly = copy.deepcopy(polys)
             return Polygon(np.array(poly).reshape((-1,2))).area
 
+        dirn = os.path.abspath(temp_dir)
+        os.makedirs(dirn, exist_ok=True)
+
+        tmp_txt = os.path.join(dirn, 'temp_all_det_cors.txt')
         with open(file_path, 'r') as f:
             data = json.load(f)
-            with open('temp_all_det_cors.txt', 'w') as f2:
+            with open(tmp_txt, 'w') as f2:
                 for ix in range(len(data)):
                     poly_area = compute_area(data[ix]['polys'])
                     if data[ix]['score'] > 0.1:
@@ -100,10 +104,7 @@ class TextDetEvaluator(DatasetEvaluator):
                             outstr = outstr + str(int(data[ix]['polys'][i][0])) +','+str(int(data[ix]['polys'][i][1])) +','
                         outstr = outstr + str(round(data[ix]['score'], 3)) + ',' + '####' + '\n'
                         f2.writelines(outstr)
-        dirn = temp_dir
-        fres = open('temp_all_det_cors.txt', 'r').readlines()
-        if not os.path.isdir(dirn):
-            os.mkdir(dirn)
+        fres = open(tmp_txt, 'r').readlines()
 
         for line in fres:
             line = line.strip()
@@ -116,11 +117,12 @@ class TextDetEvaluator(DatasetEvaluator):
                 score = ptr[-2]
                 cors = ','.join(e for e in ptr[:-2])
                 fout.writelines(cors+',####'+'\n')
-        os.remove("temp_all_det_cors.txt")
+        if os.path.exists(tmp_txt):
+            os.remove(tmp_txt)
 
     def sort_detection(self, temp_dir):
-        origin_file = os.path.normpath(temp_dir)
-        output_file = os.path.normpath("final_"+temp_dir)
+        origin_file = os.path.abspath(os.path.normpath(temp_dir))
+        output_file = os.path.abspath(os.path.normpath("final_"+temp_dir))
 
         if not os.path.isdir(output_file):
             os.mkdir(output_file)
@@ -130,50 +132,46 @@ class TextDetEvaluator(DatasetEvaluator):
 
         for i in files:
             out = i.replace(origin_file, output_file)
-            fin = open(i, 'r').readlines()
-            fout = open(out, 'w')
-            for iline, line in enumerate(fin):
-                ptr = line.strip().split(',')
-                cors = ptr[:-1]
-                assert(len(cors) %2 == 0), 'cors invalid.'
-                pts = [(int(cors[j]), int(cors[j+1])) for j in range(0,len(cors),2)]
-                try:
-                    pgt = Polygon(pts)
-                except Exception as e:
-                    print(e)
-                    print('An invalid detection in {} line {} is removed ... '.format(i, iline))
-                    continue
-                
-                if not pgt.is_valid:
-                    print('An invalid detection in {} line {} is removed ... '.format(i, iline))
-                    continue
+            with open(i, 'r') as fin:
+                lines = fin.readlines()
+            with open(out, 'w') as fout:
+                for iline, line in enumerate(lines):
+                    ptr = line.strip().split(',')
+                    cors = ptr[:-1]
+                    assert(len(cors) %2 == 0), 'cors invalid.'
+                    pts = [(int(cors[j]), int(cors[j+1])) for j in range(0,len(cors),2)]
+                    try:
+                        pgt = Polygon(pts)
+                    except Exception as e:
+                        print(e)
+                        print('An invalid detection in {} line {} is removed ... '.format(i, iline))
+                        continue
                     
-                pRing = LinearRing(pts)
-                if pRing.is_ccw:
-                    pts.reverse()
-                outstr = ''
-                for ipt in pts[:-1]:
-                    outstr += (str(int(ipt[0]))+','+ str(int(ipt[1]))+',')
-                outstr += (str(int(pts[-1][0]))+','+ str(int(pts[-1][1])))
-                outstr = outstr+',####'
-                fout.writelines(outstr+'\n')
-            fout.close()
-        os.chdir(output_file)
+                    if not pgt.is_valid:
+                        print('An invalid detection in {} line {} is removed ... '.format(i, iline))
+                        continue
+                        
+                    pRing = LinearRing(pts)
+                    if pRing.is_ccw:
+                        pts.reverse()
+                    outstr = ''
+                    for ipt in pts[:-1]:
+                        outstr += (str(int(ipt[0]))+','+ str(int(ipt[1]))+',')
+                    outstr += (str(int(pts[-1][0]))+','+ str(int(pts[-1][1])))
+                    outstr = outstr+',####'
+                    fout.writelines(outstr+'\n')
 
-        def zipdir(path, ziph):
-            # ziph is zipfile handle
-            for root, dirs, files in os.walk(path):
+        # Use absolute path for det.zip instead of os.chdir tricks
+        det_zip_path = os.path.abspath("det.zip")
+        with zipfile.ZipFile(det_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(output_file):
                 for file in files:
-                    ziph.write(os.path.join(root, file))
+                    zipf.write(os.path.join(root, file), arcname=file)
 
-        zipf = zipfile.ZipFile('../det.zip', 'w', zipfile.ZIP_DEFLATED)
-        zipdir('./', zipf)
-        zipf.close()
-        os.chdir("../")
-        # clean temp files
-        shutil.rmtree(origin_file)
-        shutil.rmtree(output_file)
-        return "det.zip"
+        # clean temp files (ignore_errors=True avoids Errno 39 on NFS/GC delay)
+        shutil.rmtree(origin_file, ignore_errors=True)
+        shutil.rmtree(output_file, ignore_errors=True)
+        return det_zip_path
     
     def evaluate_with_official_code(self, result_path, gt_path):
         return text_eval_script_det.text_eval_main_det(det_file=result_path, gt_file=gt_path)
@@ -205,6 +203,7 @@ class TextDetEvaluator(DatasetEvaluator):
             file_path = os.path.join(self._output_dir, "text_results.json")
 
         self._logger.info("Saving results to {}".format(file_path))
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with PathManager.open(file_path, "w") as f:
             f.write(json.dumps(coco_results))
             f.flush()
@@ -214,7 +213,7 @@ class TextDetEvaluator(DatasetEvaluator):
         if not self._text_eval_gt_path:
             return copy.deepcopy(self._results)
         # eval text
-        temp_dir = "temp_det_results/"
+        temp_dir = "temp_det_results"
         self.to_eval_format(file_path, temp_dir)
         result_path = self.sort_detection(temp_dir)
         text_result = self.evaluate_with_official_code(result_path, self._text_eval_gt_path)

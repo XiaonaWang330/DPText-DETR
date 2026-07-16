@@ -378,7 +378,83 @@ _C.MODEL.TRANSFORMER.EFSA = False
 _C.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR = False  # V9: CLIP language prior with image-adaptive prompts
 _C.MODEL.TRANSFORMER.CLIP_MODEL_PATH = ""  # V9: local path to CLIP weights (empty = use HF hub)
 _C.MODEL.TRANSFORMER.USE_SFA = False  # V13: Semantic Feature Alignment
-_C.MODEL.TRANSFORMER.SFA_AGG_MODE = "point"  # V21/V22: "point"=per-point, "max"=per-query max, "mean"=per-query mean
+_C.MODEL.TRANSFORMER.SFA_AGG_MODE = "point"  # V21/V22: "point", "max", "mean"
+_C.MODEL.TRANSFORMER.SFA_NUM_LAYERS = 1  # number of decoder layers (from last) with SFA injection
+
+# V61: CLIP Spatial Guidance — injects CLIP visual-semantic priors at FPN feature map level
+# Unlike SFA: operates BEFORE transformer, provides spatial PRIORS not classification,
+#             zero gradient to cls_head, enhances ALL downstream heads.
+_C.MODEL.TRANSFORMER.USE_CSG = False
+
+# V62: Cross-Modal Feature Enhancement (CMFE) — TRUE multi-modal: Vision + Language.
+# Frozen CLIP Text Encoder (multi-prompts) + Vision Encoder interact via channel-wise
+# semantic modulation (768D → 768D, NO scalar collapse, NO classification).
+# Injected at FPN BEFORE transformer → all downstream modules benefit.
+# Unlike all SFA variants: does NOT answer "is this text?" → NO competition with cls_head.
+_C.MODEL.TRANSFORMER.USE_CMFE = False
+_C.MODEL.TRANSFORMER.CMFE_USE_SIGMOID_SCALE = True  # V3: sigmoid(scale)∈[0,1] enhance-only; False→tanh(scale)∈[-1,1]
+_C.MODEL.TRANSFORMER.CMFE_USE_MIN_BOOST = False  # SDA: min_boost floor (proven harmful, default off)
+_C.MODEL.TRANSFORMER.CMFE_GATE_MODE = "sigmoid"  # "sigmoid"=v3, "relu"=v2(loose), "adaptive"=uncertainty-weighted
+
+# SATR: Scale-Adaptive Topology Refinement
+# Gaussian distance-aware intra-SA bias + FiLM circonv modulation.
+# Prevents small-text feature collapse and adapts convolution receptive field
+# to text instance size.
+_C.MODEL.TRANSFORMER.USE_SATR = False
+_C.MODEL.TRANSFORMER.SATR_SIGMA_RELAX = False  # V2: dyn_sigma*2.0 + 0.05 floor (R recovery)
+_C.MODEL.TRANSFORMER.SATR_DECOUPLED = False    # V3: decoupled sigma + geometry area prior
+
+# CURA: Curvature-Aware Residual Aggregation (replaces SATR V1 Gaussian)
+# Perona-Malik anisotropic diffusion → curvature modulates residual injection:
+#   high curvature (corners) → modulation ≈ 0 → preserve P
+#   low curvature  (smooth)  → modulation ≈ 1 → boost R
+# Zero-init kappa_gate → training starts as exact V1 → safe.
+_C.MODEL.TRANSFORMER.SATR_USE_CURA = False
+
+# V51: detach h_cur input for SFA → zero SFA→h_cur gradient → h_cur distribution
+#      matches baseline exactly → GCR operates on stable h_cur → no P/R seesaw
+_C.MODEL.TRANSFORMER.SFA_DETACH_INPUT = False
+
+# V55: FiLM Fusion — SFA modulates GCR via Feature-wise Linear Modulation
+# When True:
+#   - SFA produces per-point gamma/beta (scalar modulation) from semantic features
+#   - gamma/beta modulate GCR's geometric features before ring processing
+#   - semantic_logit is NOT injected into outputs_class (no cls pollution)
+#   - SFA only serves: alignment loss + FiLM modulation
+#   - Requires: USE_SFA=True, SFA_DETACH_INPUT=True, GCR.ENABLED=True
+_C.MODEL.TRANSFORMER.SFA_FILM_GCR = False
+
+# V40: Geometric Context Refinement (GCR)
+_C.MODEL.TRANSFORMER.GCR = CN()
+_C.MODEL.TRANSFORMER.GCR.ENABLED = False
+_C.MODEL.TRANSFORMER.GCR.HIDDEN_DIM = 128
+_C.MODEL.TRANSFORMER.GCR.CLS_BONUS = False  # V42: GCR ring features → classification bias (detached)
+_C.MODEL.TRANSFORMER.GCR.NUM_LAYERS = 1     # V43: number of decoder layers (from last) that apply GCR
+_C.MODEL.TRANSFORMER.GCR.COORD_ONLY = False  # V49: coord-only mode (no h_cur → no coupling with SFA)
+_C.MODEL.TRANSFORMER.GCR.USE_ATTENTION = False  # V52: ring self-attention instead of ring conv
+_C.MODEL.TRANSFORMER.GCR.USE_SCGR = False  # V56: Spectral-Curvature refinement (replaces ring conv)
+_C.MODEL.TRANSFORMER.GCR.SCGR_SEMANTIC_GATE = False  # V3: semantic gate proven harmful in combos, default off
+_C.MODEL.TRANSFORMER.GCR.SCGR_USE_SCALAR_CURVATURE = False  # SDA: True→v1 scalar curvature gate (high-P); False→v2.1 Frenet
+
+# V41: SFA alignment loss pathway detach
+# When True, the feat_proj used by loss_sfa_align is detached → alignment loss
+# trains semantic_proj params only, does NOT shape h_cur → preserves GCR's
+# indirect P improvement (GCR-only P=91.84). semantic_logit injection (path A)
+# remains attached so classification bonus still shapes h_cur via cls loss.
+_C.MODEL.TRANSFORMER.SFA_ALIGN_DETACH = False
+
+_C.MODEL.TRANSFORMER.MATCH_DECOUPLE = False
+
+# V49: Selective matching decoupling.
+# When MATCH_DECOUPLE=True:
+#   MATCH_DECOUPLE_SFA=True  (default, v47): decouple BOTH cls (SFA) and coord (GCR) from matching
+#   MATCH_DECOUPLE_SFA=False (v49): decouple ONLY coord (GCR); SFA-enhanced cls participates in matching
+# Rationale: SFA's semantic prior improves matching (R↑), while GCR's correction causes over-matching (P↓).
+# Keeping SFA in matching + GCR out creates synergy: better matching → cleaner GCR training targets.
+_C.MODEL.TRANSFORMER.MATCH_DECOUPLE_SFA = True
+
+
+
 
 
 _C.MODEL.TRANSFORMER.LOSS = CN()
@@ -398,6 +474,7 @@ _C.MODEL.TRANSFORMER.LOSS.SFA_ALIGN_WEIGHT = 0.5    # V15: SFA alignment loss we
 _C.MODEL.TRANSFORMER.LOSS.SFA_BG_MARGIN = 0.1       # V22: hinge margin for bg contrastive (push bg cos_sim < margin)
 _C.MODEL.TRANSFORMER.LOSS.SFA_ALIGN_BG_WEIGHT = 0.1 # V22: bg contrastive loss weight
 _C.MODEL.TRANSFORMER.LOSS.AUX_ENSEMBLE_LAYERS = 3   # V11: aux ensemble layers
+# (LAIR-related loss configs removed)
 
 
 _C.SOLVER.OPTIMIZER = "ADAMW"

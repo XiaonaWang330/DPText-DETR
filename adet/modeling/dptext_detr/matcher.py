@@ -104,7 +104,7 @@ class CtrlPointHungarianMatcher(nn.Module):
             class_weight: float = 1,
             coord_weight: float = 1,
             focal_alpha: float = 0.25,
-            focal_gamma: float = 2.0
+            focal_gamma: float = 2.0,
     ):
         """Creates the matcher
         Params:
@@ -119,6 +119,11 @@ class CtrlPointHungarianMatcher(nn.Module):
         assert class_weight != 0 or coord_weight != 0, "all costs cant be 0"
 
     def forward(self, outputs, targets):
+        """Performs the matching.
+        Args:
+            outputs: dict with pred_logits, pred_ctrl_points
+            targets: list of target dicts per image
+        """
         with torch.no_grad():
             bs, num_queries = outputs["pred_logits"].shape[:2]
 

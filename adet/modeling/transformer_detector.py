@@ -151,7 +151,6 @@ class TransformerPureDetector(nn.Module):
             sfa_module=self.dptext_detr.sfa if self.dptext_detr.use_sfa else None,
             bg_margin=loss_cfg.get('SFA_BG_MARGIN', 0.1),
             bg_weight=loss_cfg.get('SFA_ALIGN_BG_WEIGHT', 0.1),
-            sfa_hnm_weight=loss_cfg.get('SFA_HNM_WEIGHT', 0.0),
         )
 
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)

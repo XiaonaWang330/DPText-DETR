@@ -1,19 +1,20 @@
 _BASE_: "../Base.yaml"
 
+SEED: 42
+
 DATASETS:
   TRAIN: ("ctw1500_poly_train_rotate_pos",)
   TEST: ("ctw1500_poly_test",)
 
 MODEL:
   WEIGHTS: "pretrain.pth"
-  GA_STEPS: 4
+  GA_STEPS: 1  # no gradient accumulation
   TRANSFORMER:
-    USE_CLIP_LANG_PRIOR: True  # V9: CLIP language prior with image-adaptive prompts
-    CLIP_MODEL_PATH: "pretrain/clip-vit-base-patch16"
+    USE_CLIP_LANG_PRIOR: False
 
 SOLVER:
-  IMS_PER_BATCH: 2
-  BASE_LR: 2e-5
+  IMS_PER_BATCH: 8         # A100 40G easily handles 8 imgs per step
+  BASE_LR: 2e-5             # same effective batch → same LR
   LR_BACKBONE: 2e-6
   WARMUP_ITERS: 0
   STEPS: (100000,)
@@ -27,4 +28,7 @@ INPUT:
 TEST:
   EVAL_PERIOD: 1000
 
-OUTPUT_DIR: "output/r_50_poly/ctw1500/V9"
+DATALOADER:
+  NUM_WORKERS: 4  # A100 server typically has many CPU cores
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/baseline_A100"

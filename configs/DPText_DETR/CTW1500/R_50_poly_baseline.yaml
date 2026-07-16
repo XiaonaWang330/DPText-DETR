@@ -1,5 +1,7 @@
 _BASE_: "../Base.yaml"
 
+SEED: 42
+
 DATASETS:
   TRAIN: ("ctw1500_poly_train_rotate_pos",)
   TEST: ("ctw1500_poly_test",)

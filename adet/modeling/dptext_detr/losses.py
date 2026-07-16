@@ -55,7 +55,6 @@ class SetCriterion(nn.Module):
             sfa_module=None,
             bg_margin=0.1,
             bg_weight=0.1,
-            sfa_hnm_weight=0.0,
     ):
         """ Create the criterion.
         Parameters:
@@ -68,7 +67,6 @@ class SetCriterion(nn.Module):
             - sfa_module: optional SemanticFeatureAlignment for alignment loss
             - bg_margin: V22: hinge margin for bg contrastive (push bg cos_sim < margin)
             - bg_weight: V22: relative weight of bg contrastive loss
-            - sfa_hnm_weight: V23: semantic hard negative mining (0=off for V22)
         """
         super().__init__()
         self.num_classes = num_classes
@@ -83,12 +81,9 @@ class SetCriterion(nn.Module):
         self.sfa_module = sfa_module
         self.bg_margin = bg_margin
         self.bg_weight = bg_weight
-        self.sfa_hnm_weight = sfa_hnm_weight
 
     def loss_labels(self, outputs, targets, indices, num_inst, log=False):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
+        """Classification loss (NLL)"""
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
 
@@ -110,9 +105,26 @@ class SetCriterion(nn.Module):
         target_classes_onehot.scatter_(-1, target_classes.unsqueeze(-1), 1)
         target_classes_onehot = target_classes_onehot[..., :-1]
         # src_logits, target_classes_onehot: (bs, nq, n_pts, 1)
-        loss_ce = sigmoid_focal_loss(
-            src_logits, target_classes_onehot, num_inst, alpha=self.focal_alpha, gamma=self.focal_gamma
-        ) * src_logits.shape[1]
+
+        # Focal loss reduction
+        prob = src_logits.sigmoid()
+        ce_loss = F.binary_cross_entropy_with_logits(
+            src_logits, target_classes_onehot, reduction="none"
+        )
+        p_t = prob * target_classes_onehot + (1 - prob) * (1 - target_classes_onehot)
+        loss_per_element = ce_loss * ((1 - p_t) ** self.focal_gamma)
+
+        if self.focal_alpha >= 0:
+            alpha_t = self.focal_alpha * target_classes_onehot + (1 - self.focal_alpha) * (1 - target_classes_onehot)
+            loss_per_element = alpha_t * loss_per_element
+
+        # Reduce to scalar (same pattern as sigmoid_focal_loss reduction)
+        if loss_per_element.ndim == 4:
+            loss_ce = loss_per_element.mean((1, 2)).sum() / num_inst
+        elif loss_per_element.ndim == 3:
+            loss_ce = loss_per_element.mean(1).sum() / num_inst
+
+        loss_ce = loss_ce * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
 
         return losses
@@ -168,13 +180,6 @@ class SetCriterion(nn.Module):
 
         return losses
 
-    @staticmethod
-    def _get_src_permutation_idx(indices):
-        # permute predictions following indices
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
-
     def loss_sfa_align(self, outputs, targets, indices, num_inst):
         """Semantic Feature Alignment loss: positive pull + background contrastive push."""
         if self.sfa_module is None:
@@ -185,7 +190,7 @@ class SetCriterion(nn.Module):
             return {'loss_sfa_align': torch.tensor(0.0, device=outputs['pred_logits'].device)}
 
         feat_proj = sfa_info['feat_proj']   # (B, N, 16, D)
-        c_text = sfa_info['c_text']          # (D,)
+        c_text = sfa_info['c_text']          # (K, D) — K prototypes
         pos_idx = self._get_src_permutation_idx(indices)
 
         # V22: construct background mask (unmatched queries)
@@ -200,11 +205,11 @@ class SetCriterion(nn.Module):
         return {'loss_sfa_align': loss}
 
     @staticmethod
-    def _get_tgt_permutation_idx(indices):
-        # permute targets following indices
-        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
-        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
-        return batch_idx, tgt_idx
+    def _get_src_permutation_idx(indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
 
     def get_loss(self, loss, outputs, targets, indices, num_inst, **kwargs):
         loss_map = {
@@ -226,8 +231,17 @@ class SetCriterion(nn.Module):
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}
         
+        # V47: MED — use clean matching outputs if available (no SFA/GCR contamination)
+        # Hungarian matcher sees stable, baseline-level outputs → matching = reliable.
+        # Loss computation still uses enhanced pred_logits/pred_ctrl_points.
+        matching_outputs = outputs_without_aux
+        if 'matching_logits' in outputs and 'matching_ctrl_points' in outputs:
+            matching_outputs = {**outputs_without_aux,
+                                'pred_logits': outputs['matching_logits'],
+                                'pred_ctrl_points': outputs['matching_ctrl_points']}
+
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.dec_matcher(outputs_without_aux, targets)
+        indices = self.dec_matcher(matching_outputs, targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_inst = sum(len(t['ctrl_points']) for t in targets)
