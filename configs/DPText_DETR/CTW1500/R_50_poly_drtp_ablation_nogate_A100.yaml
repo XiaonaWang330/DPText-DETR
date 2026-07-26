@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------- #
+# [ABLATION] GateNet removal: CLIP_USE_GATE=False
+# ---------------------------------------------------------------------------- #
+# Formula: F'_l = F_l + α_l * V_l   (no spatial gate, only mask_valid)
+# Question: Is GateNet an essential suppressor of false positives, or does it
+#           over-suppress weak text?  If F1 improves without gate, GateNet
+#           should be redesigned, not kept.
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+    USE_TACT: False
+
+    USE_CLIP: True
+    CLIP_DENSE_FUSION: True
+    CLIP_PROMPT_GATE: False
+    CLIP_QUERY_FUSION: False
+    CLIP_BACKBONE: "ViT-B-16"
+    CLIP_PRETRAINED: "pretrain/clip-vit-base-patch16"
+    CLIP_FREEZE: True
+    CLIP_GATE_INIT: 0.0
+    CLIP_DROPOUT: 0.0
+    CLIP_ALPHA_INIT: 0.5
+    CLIP_KEEP_ASPECT: True
+
+    CLIP_USE_GATE: False
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/drtp_ablation_nogate_A100"

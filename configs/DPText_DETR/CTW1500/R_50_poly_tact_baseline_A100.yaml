@@ -11,8 +11,8 @@ MODEL:
   GA_STEPS: 1
   TRANSFORMER:
     USE_CLIP_LANG_PRIOR: False
-    USE_SATR: True
-    SATR_USE_CURA: True
+    USE_TACT: True
+    TACT_USE_CURA: False   # off → uniform gaussian (match old SATR v1)
 
 SOLVER:
   IMS_PER_BATCH: 8
@@ -33,4 +33,4 @@ TEST:
 DATALOADER:
   NUM_WORKERS: 4
 
-OUTPUT_DIR: "output/r_50_poly/ctw1500/cura_solo_A100"
+OUTPUT_DIR: "output/r_50_poly/ctw1500/tact_baseline_A100"

@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------- #
+# Phase 0: Matcher Decoupling Diagnostic (CTW1500, A100, SEED=42)
+# ---------------------------------------------------------------------------- #
+# Purpose: Test whether CLIP-shuffled classification distortion in the
+#          Hungarian matcher is the root cause of the shuffle+TACT collapse.
+#
+# Mechanism:
+#   - Forward 1 (fused, with grad): FPN + shuffled CLIP → Transformer → logits/points
+#     → used for training loss (loss_ce, loss_ctrl_points)
+#   - Forward 2 (visual, no_grad):  FPN only (NO CLIP) → Transformer → logits
+#     → used ONLY for Hungarian classification cost
+#
+# Prediction: if matcher coupling is the root cause, R should recover
+#             from 83.85 toward ~85+ while P drops from 92.68.
+#
+# Baseline: shuffle+TACT = P=92.68, R=83.85, F1=88.05
+#
+# NOTE: DROPOUT=0 for clean diagnostic (two forward passes must use
+#       the same random state to isolate CLIP as the only variable).
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+    USE_TACT: True
+    TACT_USE_CURA: False
+
+    # ── CLIP Dense + Shuffle ──
+    USE_CLIP: True
+    CLIP_DENSE_FUSION: True
+    CLIP_SHUFFLE: True              # <-- shuffle CLIP patches
+    CLIP_PROMPT_GATE: False
+    CLIP_QUERY_FUSION: False
+    CLIP_BACKBONE: "ViT-B-16"
+    CLIP_PRETRAINED: "pretrain/clip-vit-base-patch16"
+    CLIP_FREEZE: True
+    CLIP_GATE_INIT: 0.0
+    CLIP_DROPOUT: 0.0
+    CLIP_ALPHA_INIT: 0.5
+    CLIP_KEEP_ASPECT: True
+
+    # ── Phase 0: Matcher Decoupling Diagnostic ──
+    MATCHER_DECOUPLE_DIAG: True     # <-- visual logits → matcher; fused logits → loss
+    DROPOUT: 0.0                    # <-- eliminate dropout noise in dual-forward
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/matcher_decouple_diag_A100"

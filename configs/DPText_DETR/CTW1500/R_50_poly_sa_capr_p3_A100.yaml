@@ -1,0 +1,105 @@
+# ---------------------------------------------------------------------------- #
+# SA-CAPR-P3: Scene-Adaptive Conservative Antipodal Prompt Reallocation
+# ---------------------------------------------------------------------------- #
+# Purpose: Replace MM-P3's static text prototypes with dynamic per-image
+#   antipodal prompts and conservative gate reallocation.
+#
+# Architecture:
+#   1. q_b = prompt_axis + scene_projector(LN(pool(detector_P3)))
+#   2. Dynamic pos/neg prototypes via frozen CLIP text with ±q_b at shared token
+#   3. margin = sim(patch, pos) - sim(patch, neg)  (per-image semantic field)
+#   4. Conservative gate: final_logits = base_logits + rho * (margin - center)
+#      where center preserves first-order gate mass
+#   5. F'_3 = F_3 + alpha_3 * sigmoid(final_logits) * V_3
+#
+# Key design:
+#   - rho=0, prompt_axis=0, scene_projector=0 → step 0 == P3-DRTP exactly.
+#   - Scene-adaptive: prompt adapts to each image's detector features.
+#   - Conservative: gate mass preserved to first order (no expansion).
+#   - CLIP vision/text frozen; gradient flows through q_b → prompt params.
+#
+# Relevant baselines (seed=42):
+#   P3-DRTP:    P=91.38  R=85.57  F1=88.38
+#   MM-P3:      P=90.81  R=85.97  F1=88.32
+#
+# Success criteria:
+#   P ≥ 91.20, R ≥ 85.90, F1 ≥ 88.50
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+
+    # ── P3-DRTP (CLIP → P3 only) ──
+    USE_CLIP: True
+    CLIP_DENSE_FUSION: True
+    CLIP_PROMPT_GATE: False
+    CLIP_QUERY_FUSION: False
+    CLIP_BACKBONE: "ViT-B-16"
+    CLIP_PRETRAINED: "pretrain/clip-vit-base-patch16"
+    CLIP_FREEZE: True
+    CLIP_GATE_INIT: 0.0
+    CLIP_DROPOUT: 0.0
+    CLIP_ALPHA_INIT: 0.5
+    CLIP_KEEP_ASPECT: True
+    CLIP_ACTIVE_LEVELS: [0]        # P3 only
+
+    # ── SA-CAPR: Scene-Adaptive Conservative Antipodal Prompt ──
+    CLIP_TEXT_GATE: True
+    CLIP_TEXT_GATE_MODE: "sa_capr"          # <-- enables SA-CAPR
+    CLIP_TEXT_GATE_LEVEL: 0                 # modulate P3 gate
+    CLIP_TEXT_GATE_SCALE_INIT: 0.0          # rho=0 → step 0 == P3-DRTP
+    CLIP_TEXT_TEMPERATURE: 0.07
+    CLIP_TEXTNESS_CLAMP: 10.0
+
+    SA_CAPR_POSITIVE_TEMPLATE: "a scene text"
+    SA_CAPR_NEGATIVE_TEMPLATE: "a text-like background pattern"
+
+    # MM-P3 prompt bank (kept for config compat, ignored in sa_capr mode)
+    CLIP_POSITIVE_PROMPTS:
+      - "a photo of text"
+      - "a region containing written text"
+      - "printed or handwritten characters"
+      - "words in a natural scene"
+      - "scene text"
+
+    CLIP_NEGATIVE_PROMPTS:
+      - "a background region without text"
+      - "a non-text object"
+      - "natural scenery without writing"
+      - "texture without readable characters"
+      - "a region containing no text"
+
+    # ── No other modules ──
+    USE_TACT: False
+    CLIP_SHUFFLE: False
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/sa_capr_p3_A100"

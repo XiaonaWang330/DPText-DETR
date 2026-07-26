@@ -37,3 +37,12 @@ Thumbs.db
 # Backup files
 *.bak
 *.v22_backup
+
+# ── Junk / large / non-source ──
+Miniconda*.sh
+all_whl/
+whl/
+datasets/
+detectron2/
+experiments/
+*.pth.*

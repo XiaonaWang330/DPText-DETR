@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------- #
+# [BRIDGE] P3-DRTP + TACT  — Key disambiguation experiment
+# ---------------------------------------------------------------------------- #
+# Purpose: Determines whether TACT conflicts with full-DRTP originate from
+#   multi-level CLIP injection (P4/P5/P6) or from TACT's own geometric residuals.
+#
+# Hypotheses:
+#   A) If AP50:95 ≥ P3's 61.80 → P4/P5/P6 are the main conflict source.
+#   B) If AP50:95 between P3(61.80) and TACT(60.84) → both multi-level
+#      pollution AND TACT self-overcorrection contribute.
+#   C) If AP50:95 ≈ TACT(60.84) → TACT itself is the dominant bottleneck.
+#
+# Baseline references (SEED=42):
+#   P3:       P=91.38 R=85.57 F1=88.38 AP50=82.19 AP50:95=61.80
+#   TACT:     P=91.52 R=85.12 F1=88.20 AP50=81.92 AP50:95=60.84
+#   P1-P6:    P=90.70 R=86.31 F1=88.45 AP50=?    AP50:95=? (missing)
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+
+    # ── P3-DRTP (CLIP → P3 only) ──
+    USE_CLIP: True
+    CLIP_DENSE_FUSION: True
+    CLIP_PROMPT_GATE: False
+    CLIP_QUERY_FUSION: False
+    CLIP_BACKBONE: "ViT-B-16"
+    CLIP_PRETRAINED: "pretrain/clip-vit-base-patch16"
+    CLIP_FREEZE: True
+    CLIP_GATE_INIT: 0.0
+    CLIP_DROPOUT: 0.0
+    CLIP_ALPHA_INIT: 0.5
+    CLIP_KEEP_ASPECT: True
+    CLIP_ACTIVE_LEVELS: [0]        # P3 only
+
+    # ── TACT (same as tact_baseline) ──
+    USE_TACT: True
+    TACT_USE_CURA: False          # off → uniform gaussian (match tact_baseline)
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/drtp_p3_tact_A100"

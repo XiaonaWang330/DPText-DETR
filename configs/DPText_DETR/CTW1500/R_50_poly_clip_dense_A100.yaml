@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------- #
+# MCGF Phase 1: TACT + CLIP Dense Visual Adapter (CTW1500, A100, SEED=42)
+# ---------------------------------------------------------------------------- #
+# Parent: TACT solo (P=91.52, R=85.12, F1=88.20) — FROZEN_V1
+# Target: TACT + frozen CLIP ViT-B/16 patch features → encoder feature pyramid
+#         via learnable gated residual (zero-init).
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+    USE_TACT: True
+    TACT_USE_CURA: False   # off → uniform gaussian (match old SATR v1)
+
+    # ── MCGF Phase 1: CLIP Dense Fusion ──
+    USE_CLIP: True
+    CLIP_DENSE_FUSION: True
+    CLIP_PROMPT_GATE: False       # Phase 2 (reserved, not implemented)
+    CLIP_QUERY_FUSION: False      # Phase 3 (reserved, not implemented)
+    CLIP_BACKBONE: "ViT-B-16"
+    CLIP_PRETRAINED: "pretrain/clip-vit-base-patch16"
+    CLIP_FREEZE: True
+    CLIP_GATE_INIT: 0.0
+    CLIP_DROPOUT: 0.0
+    CLIP_ALPHA_INIT: 0.5          # >0 → gate net gets gradient from step 1
+    CLIP_KEEP_ASPECT: True        # preserve aspect ratio for CTW1500
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/clip_dense_v2_A100"

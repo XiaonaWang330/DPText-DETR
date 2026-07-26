@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------- #
+# Experiment #3: DRTP_v2 noise ablation (decisive control)
+# ---------------------------------------------------------------------------- #
+# Purpose: Replace CLIP features with learnable noise — keep all architecture
+#          (gate, alpha, projectors) intact. If F1 still ~88.4, gain is from
+#          the gated residual architecture, NOT from CLIP semantics.
+# Hypothesis: If noise ≈ solo/shuffle → CLIP is irrelevant (architecture wins).
+#             If noise drops to baseline → CLIP matters, shuffle needs re-explaining.
+# ---------------------------------------------------------------------------- #
+# Parent: R_50_poly_drtp_v2_solo_A100.yaml
+# Change: CLIP_REPLACE_NOISE: True → learnable noise instead of CLIP features
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+    USE_TACT: False
+
+    # ── DRTP_v2: Gated residual with learnable noise (NO CLIP) ──
+    USE_CLIP: True
+    CLIP_DENSE_FUSION: True
+    CLIP_PROMPT_GATE: False
+    CLIP_QUERY_FUSION: False
+    CLIP_BACKBONE: "ViT-B-16"
+    CLIP_PRETRAINED: "pretrain/clip-vit-base-patch16"
+    CLIP_FREEZE: True
+    CLIP_GATE_INIT: 0.0
+    CLIP_DROPOUT: 0.0
+    CLIP_ALPHA_INIT: 0.5
+    CLIP_KEEP_ASPECT: True
+    CLIP_REPLACE_NOISE: True      # ← replaces CLIP features with learnable noise
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/drtp_v2_noise_A100"

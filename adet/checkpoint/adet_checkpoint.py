@@ -42,32 +42,54 @@ class AdetCheckpointer(DetectionCheckpointer):
 
     def _load_model(self, checkpoint):
         """
-        Load model state dict, allowing missing CLIP frozen params
-        (they are reloaded from HF on each init).
+        Load model state dict, with automatic key migration (SATR→TACT rename)
+        and CLIP frozen weight exclusion.
         """
+        checkpoint_model = checkpoint.get("model", checkpoint)
+
+        # ── Key migration: SATR → TACT rename ──
+        # Old checkpoints store 'satr_module.*' and 'decoder.layers.X.satr.*'.
+        # New code uses 'tact.*' and 'decoder.layers.X.tact.*'.
+        # Always migrate on load → transparent to all callers.
+        _migrated = {}
+        for k, v in checkpoint_model.items():
+            # Top-level module: dptext_detr.satr_module.* → dptext_detr.tact.*
+            if "satr_module." in k:
+                _migrated[k.replace("satr_module.", "tact.")] = v
+            # Per-decoder-layer: ...layers.X.satr.* → ...layers.X.tact.*
+            elif ".satr." in k:
+                _migrated[k.replace(".satr.", ".tact.")] = v
+            else:
+                _migrated[k] = v
+        checkpoint_model = _migrated
+
         if checkpoint.get("matching_heuristics", False):
-            # Convert weights by name-matching heuristics (legacy)
-            self._convert_ndarray_to_tensor(checkpoint["model"])
+            self._convert_ndarray_to_tensor(checkpoint_model)
             model_state = self.model.state_dict()
-            for key in checkpoint["model"]:
+            for key in checkpoint_model:
                 if key in model_state:
-                    model_state[key] = checkpoint["model"][key]
+                    model_state[key] = checkpoint_model[key]
             missing, unexpected = self.model.load_state_dict(model_state, strict=False)
         else:
-            checkpoint_model = checkpoint["model"]
             missing, unexpected = self.model.load_state_dict(
                 checkpoint_model, strict=False
             )
 
-        # Only warn about non-CLIP missing keys (CLIP frozen weights reload from HF)
-        def _is_clip_param(key):
+        # Only warn about truly unexpected missing keys.
+        # We exclude:
+        #  - CLIP frozen weights (reload from HF / CLIP pretrained on every init)
+        #  - CLIP adapter trainable params (new modules not in pretrained checkpoints)
+        #  - TACT / legacy SATR modules
+        def _is_expected_missing(key):
             return (
-                "clip_text_model." in key   # SFA, CLIP Language Prior
-                or "clip_vision." in key     # CMFE, CSG
-                or "clip_text." in key       # CMFE, CSG
+                "clip_text_model." in key   # CLIP Language Prior (reloaded from HF)
+                or "clip_adapter." in key   # CLIP Dense Adapter (new module + frozen ViT)
+                or ".tgsr." in key           # TGSR (new module, not in pretrained)
+                or "tact." in key            # TACT (new module, not in pretrained)
+                or ".satr." in key           # legacy SATR → TACT migration in progress
             )
-        real_missing = [k for k in missing if not _is_clip_param(k)]
-        real_unexpected = [k for k in unexpected if not _is_clip_param(k)]
+        real_missing = [k for k in missing if not _is_expected_missing(k)]
+        real_unexpected = [k for k in unexpected if not _is_expected_missing(k)]
         if real_missing:
             self.logger.warning(f"Missing keys: {real_missing}")
         if real_unexpected:
@@ -75,17 +97,21 @@ class AdetCheckpointer(DetectionCheckpointer):
 
     def save(self, name: str, **kwargs):
         """
-        Save checkpoint, excluding CLIP frozen weights (~600MB for ViT+Text).
-        They are reloaded from huggingface on next init.
+        Save checkpoint, excluding CLIP frozen weights (~88MB ViT + ~60MB Text).
+        They are reloaded from CLIP pretrained / HF on next init.
+        Trainable adapter params (level_projectors, level_gate_nets, level_alphas)
+        are kept — they are small (~3MB total).
         """
         data = {}
         data["model"] = OrderedDict(
             (k, v) for k, v in self.model.state_dict().items()
-            if not (
-                "clip_text_model." in k   # SFA, CLIP Language Prior
-                or "clip_vision." in k     # CMFE, CSG
-                or "clip_text." in k       # CMFE, CSG (distinct from clip_text_model.)
-            )
+            if not "clip_text_model." in k              # CLIP Language Prior (reloaded from HF)
+            and not "clip_adapter.clip_vision." in k    # CLIP ViT frozen (reloaded from pretrained)
+            and not "clip_adapter.visual_projection." in k  # CLIP vis proj frozen
+            and not "clip_adapter.text_model." in k     # CLIP text encoder frozen (~60MB!)
+            and not "clip_adapter.text_projection." in k # CLIP text proj frozen
+            and not "clip_adapter.logit_scale." in k    # CLIP logit scale frozen
+            and not "tgsr.clip_extractor." in k         # TGSR CLIP ViT frozen (reloaded from pretrained)
         )
         for key, obj in kwargs.items():
             data[key] = obj

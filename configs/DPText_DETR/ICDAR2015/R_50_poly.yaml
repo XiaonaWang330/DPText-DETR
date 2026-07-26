@@ -1,0 +1,29 @@
+_BASE_: "../Base.yaml"
+
+DATASETS:
+  TRAIN: ("icdar2015_train_pos",)
+  TEST: ("icdar2015_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 4
+
+SOLVER:
+  IMS_PER_BATCH: 2
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 2000
+
+INPUT:
+  MIN_SIZE_TRAIN: (480, 832)
+  MAX_SIZE_TRAIN: 832
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1600
+
+TEST:
+  EVAL_PERIOD: 1000
+
+OUTPUT_DIR: "output/r_50_poly/icdar2015/finetune"

@@ -1,0 +1,310 @@
+================================================================================
+           MM-P3 (Multi-Modal P3) — Text-Conditioned Gate Modulation
+================================================================================
+
+1. 模块概述（一句话）
+────────────────────────
+  在 P3-DRTP（GateNet + α 残差注入）的基础上，追加 CLIP 文本端嵌入作为
+  gate logits 的偏置项，使文本区域的 gate 值提升 → 对疑似文本区域注入更多
+  CLIP 视觉特征，实现"文本条件门控"。
+
+2. 与 baseline 的关系
+────────────────────────
+  baseline (纯视觉 Deformable DETR)
+    → DRTP-P3:  CLIP 视觉 + GateNet + α 注入 (P=91.38 R=85.57 F1=88.38)
+    → MM-P3:    DRTP-P3 + CLIP 文本偏置 gate (P=90.81 R=85.97 F1=88.32)
+
+  MM-P3 = P3-DRTP + 文本条件分支（仅作用于 P3 level 的 gate logits）
+
+3. 子机制拆分
+────────────────────────
+  3.1 CLIP 视觉编码 (frozen, 与 P3-DRTP 共享)
+      - ViT-B/16: 12 layers, patch=16, dim=768
+      - 输入 224×224 → 14×14 patch grid → 196 tokens
+      - 输出: patch_tokens (B, 196, 768)  ← 用于 GateNet 条件
+              patch_embeds (B, 196, 512) ← 用于文本相似度
+
+  3.2 CLIP 文本原型 (frozen, 初始化时预计算)
+      - 使用 CLIPTokenizer + CLIPTextModel
+      - positive prompts: ["text", "word", "letter", "a photo of text"]
+                          → 4 条编码 → avg → normalize → pos_proto (1, 512)
+      - negative prompts: ["a clean background", "a blank surface",
+                           "a smooth texture"]
+                          → 3 条编码 → avg → normalize → neg_proto (1, 512)
+      - 注册为 persistent buffer，训练中冻结不变
+
+  3.3 Textness 计算 (frozen, no_grad)
+      - 对每个 CLIP patch embedding (B, 196, 512) 分别与 pos/neg 原型做余弦相似度
+      - textness = (sim_pos - sim_neg) / temperature
+      - temperature = 0.07 (CLIP 原生温度)
+      - clamp to [-10, 10] 防止极值
+      - reshape → (B, 1, 14, 14) → interpolate → (B, 1, H_l, W_l) for P3
+
+  3.4 Gate 调制 (trainable ρ)
+      - 原始 gate_logits = GateNet(concat(src_norm, V_norm))
+      - MM-P3 偏置: gate_logits += ρ * textness
+      - ρ = text_gate_scale: nn.Parameter, zero-init (init=0.0)
+      - 训练 step 0 时 ρ=0 → 等价于 P3-DRTP，逐步学会文本偏置
+      - Gate: G = sigmoid(gate_logits) * mask_valid
+      - 残差: F_new = src + α * G * V
+
+4. 完整架构图（注入点 + 信号流）
+────────────────────────
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                         MM-P3 信号流                             │
+  │                                                                 │
+  │  clip_images                    CLIP Text Encoder (frozen)      │
+  │      │                              │                           │
+  │  ┌───▼────────────┐          ┌─────▼───────────┐               │
+  │  │ CLIP ViT-B/16  │          │ pos_prompts avg  │               │
+  │  │ (frozen, eval) │          │ neg_prompts avg  │               │
+  │  └───┬─────┬──────┘          └──┬──────────┬───┘               │
+  │      │     │                   │          │                     │
+  │  ┌───▼┐ ┌──▼────────────────┐  │   ┌──────▼──────┐              │
+  │  │V=  │ │PatchEmbeds (contr)│  │   │ pos_proto   │              │
+  │  │proj│ │  (B,196,512)      │  │   │ neg_proto   │              │
+  │  │→V  │ └────────┬──────────┘  │   │ (1,512) buf │              │
+  │  └──┬─┘          │             │   └──┬─────┬────┘              │
+  │     │     ┌──────▼─────────────┴──────┘     │                   │
+  │     │     │ cosine_sim(patch_emb, proto)      │                   │
+  │     │     │ textness = (sim_pos-sim_neg)/0.07 │                   │
+  │     │     │ clamp[-10,10] → reshape 14×14     │                   │
+  │     │     └────────┬──────────────────────────┘                   │
+  │     │              │                                             │
+  │  ┌──▼──────────────▼─────────────────┐                           │
+  │  │  concat(src_norm, V_norm)         │                           │
+  │  │         ↓                         │                           │
+  │  │  GateNet (Conv1d→ReLU→Conv1d→     │                           │
+  │  │          ReLU→Conv1d)             │                           │
+  │  │         ↓                         │                           │
+  │  │  gate_logits                      │                           │
+  │  │         +  ρ × textness  ←────── interpolate(H_l,W_l)        │
+  │  │         ↓                         │                           │
+  │  │  G = sigmoid(gate_logits)         │                           │
+  │  │         ↓                         │                           │
+  │  │  residual = α × G × V            │                           │
+  │  │         ↓                         │                           │
+  │  │  F_new = src + residual           │                           │
+  │  └───────────────────────────────────┘                           │
+  │                                                                 │
+  │  注入点: P3 only (level=0, stride=8)                             │
+  │  P4/P5/P6: identity pass-through (active_levels=[0])            │
+  └─────────────────────────────────────────────────────────────────┘
+
+5. 内部结构详情
+────────────────────────
+  5.1 Projector (level_projectors[0])
+      Conv2d(768, 256, k=1) + GroupNorm(32, 256)
+      CLIP patch tokens → 256-dim feature map
+
+  5.2 GateNet (level_gate_nets[0])
+      Conv2d(512, 256, k=1)  ← concat(src_norm, V_norm)
+      ReLU
+      Conv2d(256, 64, k=1)
+      ReLU
+      Conv2d(64, 1, k=1)     ← output: gate_logits
+      bias init = 0.0
+
+  5.3 ρ (text_gate_scale)
+      nn.Parameter, init=0.0, scalar
+      从 0 开始学 → 控制文本偏置的强度
+      正 ρ → textness>0 区域 gate 增强
+      负 ρ → textness>0 区域 gate 减弱（通常学成正数）
+
+  5.4 α (level_alphas[0])
+      nn.Parameter, init=0.5, learnable
+      控制 CLIP 特征注入的全局幅度
+
+6. 物理直觉
+────────────────────────
+  原文: 带文本的区域，CLIP 视觉特征更可靠 → gate 应更大 → 注入更多 CLIP 信息
+  反文: 背景区域，CLIP 特征噪声更大 → gate 不应被文本相似度影响
+  实现: ρ * textness 作为 gate logits 偏置 → sigmoid 之前加一项 → 
+        文本区域 gate_logits 抬高 ρ*(textness>0) → 门更开
+        ρ=0 初始化为 P3-DRTP，逐步适应
+
+7. 参数量统计 & zero-init 策略
+────────────────────────
+  组件                    │ 参数量     │ 可训练? │ 初始化
+  ────────────────────────┼───────────┼────────┼──────────
+  CLIP ViT-B/16           │ 86M        │ frozen  │ pretrained
+  CLIP Text Encoder       │ 63M        │ frozen  │ pretrained
+  pos/neg_text_proto      │ 2×512=1024 │ frozen buffer │ CLIP encode
+  Projector (P3 only)     │ 768×256=197K│ ✓      │ default
+  GateNet (P3 only)       │ ~198K      │ ✓      │ default+bias=0
+  α (P3 only)             │ 1          │ ✓      │ 0.5
+  ρ (text_gate_scale)     │ 1          │ ✓      │ 0.0
+  ────────────────────────┼───────────┼────────┼──────────
+  总计可训练               │ ~395K      │        │
+
+  Zero-init ρ: 训练 step 0 时 gate_logits = GateNet 原始输出
+               → ρ=0 → MM-P3(step0) = P3-DRTP
+               → 随训练 ρ 渐增 → 文本偏置逐渐生效
+
+8. Tensor Shape 追踪
+────────────────────────
+  Stage                        │ Shape
+  ─────────────────────────────┼────────────────────────────
+  clip_images                   │ list of (3, H_i, W_i) × B
+  → preprocess (224×224)        │ (B, 3, 224, 224)
+  → CLIP ViT output             │ (B, 197, 768)  [1 CLS + 196 patch]
+  → patch_tokens (drop CLS)     │ (B, 196, 768)
+  → patch_embeds [contr. space]  │ (B, 196, 512)  [post_ln → vis_proj → L2 norm]
+  ───────── text branch ────────┼────────────────────────────
+  pos/neg_proto                 │ (1, 512)
+  sim_pos = p @ pos.T           │ (B, 196, 1) → (B, 196)
+  sim_neg = p @ neg.T           │ (B, 196, 1) → (B, 196)
+  textness = (sp-sn)/0.07       │ (B, 196) → clamp → reshape
+  textness_2d                   │ (B, 1, 14, 14)
+  → interpolate to P3           │ (B, 1, H/8, W/8)
+  ───────── gate branch ────────┼────────────────────────────
+  clip_feat_2d                  │ (B, 768, 14, 14)
+  → Projector                   │ (B, 256, 14, 14)
+  → interpolate to P3           │ (B, 256, H/8, W/8)
+  concat(src_norm, V_norm)      │ (B, 512, H_l, W_l)
+  → GateNet                     │ (B, 1, H_l, W_l)
+  → gate_logits + ρ×textness    │ (B, 1, H_l, W_l)
+  → G = sigmoid(...)            │ (B, 1, H_l, W_l), range [0,1]
+  ───────── fusion ─────────────┼────────────────────────────
+  residual = α * G * V          │ (B, 256, H_l, W_l)
+  F_new = src + residual        │ (B, 256, H_l, W_l) → 输出
+  ─────────────────────────────┼────────────────────────────
+  P4/P5/P6 levels               │ identity: src = src (active_levels=[0])
+
+9. 配置开关 (R_50_poly_mm_p3_A100.yaml)
+────────────────────────
+  CLIP_ACTIVE_LEVELS:        [0]         # 仅 P3 注入
+  CLIP_TEXT_GATE:            True        # 启用文本门控 ★
+  CLIP_USE_GATE:             True        # 保留 GateNet
+  CLIP_LEARNABLE_ALPHA:      True
+  CLIP_POSITIVE_PROMPTS:     ["text", "word", "letter",
+                              "a photo of text"]
+  CLIP_NEGATIVE_PROMPTS:     ["a clean background",
+                              "a blank surface",
+                              "a smooth texture"]
+  CLIP_TEXT_TEMPERATURE:     0.07
+  CLIP_TEXT_GATE_LEVEL:      0           # 仅 P3 使用文本偏置
+  CLIP_TEXT_GATE_SCALE_INIT: 0.0         # zero-init ρ
+  CLIP_TEXTNESS_CLAMP:       10.0
+
+10. 与 P3-DRTP 的关键差异
+────────────────────────
+  对比维度         │ P3-DRTP                │ MM-P3
+  ────────────────┼───────────────────────┼──────────────────────
+  CLIP 编码        │ ViT vision only        │ ViT vision + Text encoder
+  额外存储         │ 无                     │ pos/neg_proto (2×512, frozen)
+  可学习参数        │ Projector+GateNet+α   │ 同上 + ρ (1个 scalar)
+  Gate 计算         │ GateNet(cat(s,V))      │ GateNet(cat(s,V)) + ρ*textness
+  文本区域处理      │ 无特殊处理             │ textness>0 → gate↑ → 更多 CLIP
+  非文本区域处理    │ 无特殊处理             │ textness≈0 → gate 不变
+  step=0 行为       │ GateNet from scratch   │ = P3-DRTP (ρ=0)
+  
+  P3-DRTP 结果:     P=91.38 R=85.57 F1=88.38
+  MM-P3 结果:       P=90.81 R=85.97 F1=88.32  ← P↓0.57 R↑0.40 F1↓0.06
+
+11. 设计哲学与教训
+────────────────────────
+  动机: 文本区域的 CLIP 视觉特征更可靠 → 用文本相似度作为 gate 偏置
+  期望: P 和 R 同时提升
+  实际: P 下降 0.57 → 文本偏置给了非文本区域噪声（误检区也 textness>0）
+        R 上升 0.40 → 弱文本区域确实得到了更多 CLIP 注入
+  结论: textness 的区分度不够精细 — 真实文本和复杂背景的 CLIP 文本相似度
+        有大量重叠区域，导致 gate 偏置在非文本区域同样抬高 → P 回落。
+        ρ 是标量而非空间自适应 → 无法在不同区域区分偏置强度。
+
+================================================================================
+                          — END: MM-P3 Architecture Analysis —
+================================================================================
+
+
+================================================================================
+             P3-DRTP vs Baseline — 可视化对比分析 (100张 CTW1500 Test)
+================================================================================
+
+1. 统计总览
+────────────────────────
+  Images analyzed:           100
+  ─────────────────────────────────────
+  P3-DRTP 总检测框:          538      (avg 5.38 / image)
+  Baseline 总检测框:         553      (avg 5.53 / image)
+  GT 总标注框:               544      (avg 5.44 / image)
+  ─────────────────────────────────────
+  P3-DRTP avg confidence:    0.8456
+  Baseline avg confidence:   0.8323
+
+2. FP/FN 代理指标 (以 GT 数量为参照)
+────────────────────────
+                         │ P3-DRTP │ Baseline │ Delta
+  ──────────────────────┼─────────┼──────────┼────────
+  FP proxy (框数-GT>0)  │  0.44   │   0.50   │ -0.06 ✓ (FP↓)
+  FN proxy (GT-框数>0)  │  0.50   │   0.41   │ +0.09 ✗ (FN↑)
+  ──────────────────────┼─────────┼──────────┼────────
+  P3更保守: 少检测 ≈15个框, 少FP但多漏检
+
+3. 逐图对比分布
+────────────────────────
+  P3 = Baseline:      75 张 (75%)
+  P3 < Baseline:      18 张 (18%)  ← P3 更保守, 丢框
+  P3 > Baseline:       7 张 (7%)   ← P3 多出框
+
+  P3少框案例 (18张): 主要为复杂背景/小文本场景
+  P3多框案例 (7张):   多为Baseline漏检但P3检测到的情况
+
+4. 置信度分析
+────────────────────────
+  P3 avg conf (0.8456) > Baseline avg conf (0.8323)
+  → P3 的 CLIP 注入提升了高置信度检测的质量
+  → 但也因此更保守: 对低置信度候选不输出 → FN↑
+
+  典型置信度差异:
+  - P3更高 (>0.05差异): image 1085 (P3:0.912 vs BL:0.767, P3更强)
+  - BL更高 (>0.05差异): image 1044 (P3:0.854 vs BL:0.820, 相近)
+  - 双低场景: image 1043 (P3:0.697 vs BL:0.667, 都是难例)
+
+5. 失败模式分类
+────────────────────────
+  5.1 小文本漏检 (FN↑ 主因)
+      - 典型: 啤酒标签、地址文字、小字号
+      - 原因: P3 stride=8, 小文本感受野不足, CLIP heatmap 弱激活
+      - Gate 在弱激活区域几乎关闭 → 小文本得不到增强
+      - 案例: 1046 (GT=4, P3=2, BL=3), 1100 (GT=5, P3=3, BL=5)
+
+  5.2 复杂背景过分割 (FP↓)
+      - 典型: 密集文字区域、弯曲文字、遮挡
+      - Baseline 容易多框 (background noise → false triggers)
+      - P3 CLIP gate 过滤了部分背景噪声 → FP 降低
+      - 案例: 1011 (GT=5, P3=9 vs BL=9), 1043 (GT=7, P3=9 vs BL=10)
+
+  5.3 孤立清晰文本 (两者一致)
+      - 典型: 标志牌、大字标题
+      - P3 和 baseline 检测数完全一致 (75张)
+      - CLIP 对清晰文本的特征与依赖 GateNet 等价
+
+6. 关键发现
+────────────────────────
+  1) P3 本质上是"保守增强器": 对强文本保持一致性, 对弱文本抑制,
+     对背景噪声过滤 → FP↓ FN↑
+  
+  2) 跷跷板效应依然存在: FP proxy -0.06 但 FN proxy +0.09
+     净效果: 检测总数少≈15个 → 不一定是坏事, 取决于 P/R 的 tradeoff
+
+  3) CLIP P3 fusion 的有效性证据:
+     - 75%图片检测数不变 → 对多数场景与baseline等效
+     - 平均置信度更高 → CLIP 特征确实增强了高质量检测
+     - 75张equal 说明 P3 不"破环"baseline 的正确检测
+
+  4) 改进方向:
+     - 小文本: 需要 P4/P5 配合 (P3 stride太大)
+     - 弱文本: GateNet 的门控太激进 → 可以降低 threshold
+     - 过分割: CLIP gate 过滤正确但有残余 → 需要更精细的空间调制
+
+7. 与 MM-P3 的关联
+────────────────────────
+  MM-P3 在 P3-DRTP 基础上加了 CLIP text gate 偏置 (ρ×textness)
+  → 旨在解决 P3 对弱文本的抑制问题 (FN↓)
+  → 但实际结果: P↓0.57 R↑0.40 → 也受跷跷板效应困扰
+  → P3 可视化确认了弱文本是核心瓶颈, 非文本噪声抑制有效
+
+================================================================================
+                     — END: P3-DRTP Visualization Analysis —
+================================================================================

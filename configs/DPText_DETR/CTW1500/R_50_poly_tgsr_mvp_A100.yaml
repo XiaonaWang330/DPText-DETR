@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------- #
+# TGSR MVP: Topology-Conditioned Semantic Routing (CTW1500, A100, SEED=42)
+# ---------------------------------------------------------------------------- #
+# Design:
+#   - CLIP is extracted ONCE (frozen) → patch feature map (14x14)
+#   - TGSR routes global + topology-conditioned local semantics
+#   - Correction is ADDITIVE to classification logits at decoder layers 4-5
+#   - CLIP does NOT enter FPN → encoder/decoder features are pure visual
+#   - TACT provides topology conditioning (control point placement)
+#
+# Formula:
+#   G = beta * [r * G_local + (1-r) * G_global]
+#   logit' = logit + G
+#   r = exp(-delta^2 / (2*sigma^2))
+#
+# Key params:
+#   - beta init = 0.0 (no correction at start, learnable)
+#   - start_layer = 4 (routing at last 2 decoder layers)
+#   - TACT uses no CURA (controlled ref_points only)
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+
+    # ── TACT: Topology-Aware Curvature Transform ──
+    USE_TACT: True
+    TACT_USE_CURA: False
+
+    # ── TGSR: Topology-Conditioned Semantic Routing ──
+    USE_TGSR: True
+    TGSR_CLIP_MODEL: "ViT-B-16"
+    TGSR_CLIP_PATH: "pretrain/clip-vit-base-patch16"
+    TGSR_START_LAYER: 4
+    TGSR_BETA_INIT: 0.0
+    TGSR_ETA: 2.0
+    TGSR_SIGMA: 0.3
+    TGSR_TEMP: 0.1
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/tgsr_mvp_A100"

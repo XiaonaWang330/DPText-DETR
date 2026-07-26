@@ -375,87 +375,83 @@ _C.MODEL.TRANSFORMER.NUM_CTRL_POINTS = 16
 _C.MODEL.TRANSFORMER.EPQM = False # for DPText-DETR
 _C.MODEL.TRANSFORMER.EFSA = False
 
-_C.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR = False  # V9: CLIP language prior with image-adaptive prompts
-_C.MODEL.TRANSFORMER.CLIP_MODEL_PATH = ""  # V9: local path to CLIP weights (empty = use HF hub)
-_C.MODEL.TRANSFORMER.USE_SFA = False  # V13: Semantic Feature Alignment
-_C.MODEL.TRANSFORMER.SFA_AGG_MODE = "point"  # V21/V22: "point", "max", "mean"
-_C.MODEL.TRANSFORMER.SFA_NUM_LAYERS = 1  # number of decoder layers (from last) with SFA injection
+_C.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR = False
+_C.MODEL.TRANSFORMER.CLIP_MODEL_PATH = "pretrain/clip-vit-base-patch16"
 
-# V61: CLIP Spatial Guidance — injects CLIP visual-semantic priors at FPN feature map level
-# Unlike SFA: operates BEFORE transformer, provides spatial PRIORS not classification,
-#             zero gradient to cls_head, enhances ALL downstream heads.
-_C.MODEL.TRANSFORMER.USE_CSG = False
+# ──────────────────────────────────────────────────────────────────────
+# TACT: Topology-Aware Curvature Transform
+# ──────────────────────────────────────────────────────────────────────
+# Three sub-mechanisms operate at each decoder layer after intra-SA + circonv:
+#   1. Gaussian Topology Aggregation — control-point distance weights share features
+#   2. Curvature-Aware Gating (Perona-Malik) — corners suppress, flats boost residual
+#   3. FiLM Circonv Modulation — scale-conditioned circular-conv modulation
+# All new params zero-init → training step 1 == exact baseline.
+_C.MODEL.TRANSFORMER.USE_TACT = False
+_C.MODEL.TRANSFORMER.TACT_USE_CURA = True       # curvature-aware gating (default ON)
+_C.MODEL.TRANSFORMER.TACT_SIGMA_RELAX = False
+_C.MODEL.TRANSFORMER.TACT_DECOUPLED = False
 
-# V62: Cross-Modal Feature Enhancement (CMFE) — TRUE multi-modal: Vision + Language.
-# Frozen CLIP Text Encoder (multi-prompts) + Vision Encoder interact via channel-wise
-# semantic modulation (768D → 768D, NO scalar collapse, NO classification).
-# Injected at FPN BEFORE transformer → all downstream modules benefit.
-# Unlike all SFA variants: does NOT answer "is this text?" → NO competition with cls_head.
-_C.MODEL.TRANSFORMER.USE_CMFE = False
-_C.MODEL.TRANSFORMER.CMFE_USE_SIGMOID_SCALE = True  # V3: sigmoid(scale)∈[0,1] enhance-only; False→tanh(scale)∈[-1,1]
-_C.MODEL.TRANSFORMER.CMFE_USE_MIN_BOOST = False  # SDA: min_boost floor (proven harmful, default off)
-_C.MODEL.TRANSFORMER.CMFE_GATE_MODE = "sigmoid"  # "sigmoid"=v3, "relu"=v2(loose), "adaptive"=uncertainty-weighted
+# ──────────────────────────────────────────────────────────────────────
+# TGSR: Topology-Conditioned Semantic Routing
+# ──────────────────────────────────────────────────────────────────────
+# CLIP is extracted once (frozen) → patch feature map (14×14).
+# TGSR routes global + topology-conditioned local semantics to decoder
+# queries at the LAST N layers, ADDITIVE to classification logits:
+#   G = beta * [r * G_local + (1-r) * G_global]
+#   logit' = logit + G
+# where r = exp(-δ² / 2σ²) from inter-layer topology drift δ.
+# β is learnable (init 0 → no correction at start).
+# CLIP does NOT enter FPN → encoder/decoder features are pure visual.
+_C.MODEL.TRANSFORMER.USE_TGSR = False                # master switch
+_C.MODEL.TRANSFORMER.TGSR_START_LAYER = 4            # first decoder layer for routing
+_C.MODEL.TRANSFORMER.TGSR_BETA_INIT = 0.0            # β init (0 = no correction; learnable)
+_C.MODEL.TRANSFORMER.TGSR_ETA = 2.0                  # reliability sharpness
+_C.MODEL.TRANSFORMER.TGSR_SIGMA = 0.3                # topology drift bandwidth
+_C.MODEL.TRANSFORMER.TGSR_TEMP = 0.1                 # cosine-sim temperature
+_C.MODEL.TRANSFORMER.TGSR_CLIP_MODEL = "ViT-B-16"    # CLIP model name
+_C.MODEL.TRANSFORMER.TGSR_CLIP_PATH = "pretrain/clip-vit-base-patch16"
 
-# SATR: Scale-Adaptive Topology Refinement
-# Gaussian distance-aware intra-SA bias + FiLM circonv modulation.
-# Prevents small-text feature collapse and adapts convolution receptive field
-# to text instance size.
-_C.MODEL.TRANSFORMER.USE_SATR = False
-_C.MODEL.TRANSFORMER.SATR_SIGMA_RELAX = False  # V2: dyn_sigma*2.0 + 0.05 floor (R recovery)
-_C.MODEL.TRANSFORMER.SATR_DECOUPLED = False    # V3: decoupled sigma + geometry area prior
+# ──────────────────────────────────────────────────────────────────────
+# CLIP Dense Fusion (DRTP-v2)
+# ──────────────────────────────────────────────────────────────────────
+# Injects frozen CLIP patch tokens into FPN via dense projection +
+# spatial-aware fusion BEFORE the encoder. Enables the encoder to
+# generate semantically-informed proposals.
+_C.MODEL.TRANSFORMER.USE_CLIP = False                # master switch for CLIP feature extraction
+_C.MODEL.TRANSFORMER.CLIP_DENSE_FUSION = False       # enable dense CLIP-to-FPN fusion
+_C.MODEL.TRANSFORMER.CLIP_SHUFFLE = False            # (ablation) permute CLIP patch tokens
+_C.MODEL.TRANSFORMER.CLIP_REPLACE_NOISE = False      # (ablation) replace CLIP tokens with noise
+_C.MODEL.TRANSFORMER.CLIP_TOKEN_MIX = False          # training-only partial token mixing
+_C.MODEL.TRANSFORMER.CLIP_TOKEN_MIX_LAMBDA = 0.1     # mixing strength (0=aligned, 1=shuffled)
+_C.MODEL.TRANSFORMER.CLIP_PROMPT_GATE = False        # learnable prompt-based gating
+_C.MODEL.TRANSFORMER.CLIP_QUERY_FUSION = False       # query-level CLIP fusion (alt path)
+_C.MODEL.TRANSFORMER.CLIP_BACKBONE = "ViT-B-16"      # CLIP model architecture
+_C.MODEL.TRANSFORMER.CLIP_PRETRAINED = "pretrain/clip-vit-base-patch16"
+_C.MODEL.TRANSFORMER.CLIP_FREEZE = True              # freeze CLIP backbone
+_C.MODEL.TRANSFORMER.CLIP_GATE_INIT = 0.0            # initial gate value
+_C.MODEL.TRANSFORMER.CLIP_DROPOUT = 0.0              # dropout on CLIP fusion
+_C.MODEL.TRANSFORMER.CLIP_ALPHA_INIT = 0.5           # alpha init for projection
+_C.MODEL.TRANSFORMER.CLIP_KEEP_ASPECT = True         # keep aspect ratio in CLIP preprocess
 
-# CURA: Curvature-Aware Residual Aggregation (replaces SATR V1 Gaussian)
-# Perona-Malik anisotropic diffusion → curvature modulates residual injection:
-#   high curvature (corners) → modulation ≈ 0 → preserve P
-#   low curvature  (smooth)  → modulation ≈ 1 → boost R
-# Zero-init kappa_gate → training starts as exact V1 → safe.
-_C.MODEL.TRANSFORMER.SATR_USE_CURA = False
+# ── DRTP Internal Ablation (Phase 1) ──
+_C.MODEL.TRANSFORMER.CLIP_ACTIVE_LEVELS = [0, 1, 2, 3]  # which FPN levels get CLIP (0=P3, 1=P4, ...)
+_C.MODEL.TRANSFORMER.CLIP_USE_GATE = True                # False → skip GateNet, direct α*V injection
+_C.MODEL.TRANSFORMER.CLIP_LEARNABLE_ALPHA = True         # False → α frozen at CLIP_FIXED_ALPHA_VALUE
+_C.MODEL.TRANSFORMER.CLIP_FIXED_ALPHA_VALUE = 0.5        # scalar α when CLIP_LEARNABLE_ALPHA=False
+_C.MODEL.TRANSFORMER.CLIP_SHARED_PROJECTOR = False       # True → one shared projector for all levels
+_C.MODEL.TRANSFORMER.CLIP_DIRECTIONAL_GATE = False     # True → direction-aware GateNet (1×7 + 7×1 strip conv)
+_C.MODEL.TRANSFORMER.CLIP_SCALE_AWARE_GATE = False    # True → per-level ScaleAwareModulator on alpha
 
-# V51: detach h_cur input for SFA → zero SFA→h_cur gradient → h_cur distribution
-#      matches baseline exactly → GCR operates on stable h_cur → no P/R seesaw
-_C.MODEL.TRANSFORMER.SFA_DETACH_INPUT = False
-
-# V55: FiLM Fusion — SFA modulates GCR via Feature-wise Linear Modulation
-# When True:
-#   - SFA produces per-point gamma/beta (scalar modulation) from semantic features
-#   - gamma/beta modulate GCR's geometric features before ring processing
-#   - semantic_logit is NOT injected into outputs_class (no cls pollution)
-#   - SFA only serves: alignment loss + FiLM modulation
-#   - Requires: USE_SFA=True, SFA_DETACH_INPUT=True, GCR.ENABLED=True
-_C.MODEL.TRANSFORMER.SFA_FILM_GCR = False
-
-# V40: Geometric Context Refinement (GCR)
+# ──────────────────────────────────────────────────────────────────────
+# GCR: Geometric Context Refinement
+# ──────────────────────────────────────────────────────────────────────
 _C.MODEL.TRANSFORMER.GCR = CN()
 _C.MODEL.TRANSFORMER.GCR.ENABLED = False
 _C.MODEL.TRANSFORMER.GCR.HIDDEN_DIM = 128
-_C.MODEL.TRANSFORMER.GCR.CLS_BONUS = False  # V42: GCR ring features → classification bias (detached)
-_C.MODEL.TRANSFORMER.GCR.NUM_LAYERS = 1     # V43: number of decoder layers (from last) that apply GCR
-_C.MODEL.TRANSFORMER.GCR.COORD_ONLY = False  # V49: coord-only mode (no h_cur → no coupling with SFA)
-_C.MODEL.TRANSFORMER.GCR.USE_ATTENTION = False  # V52: ring self-attention instead of ring conv
-_C.MODEL.TRANSFORMER.GCR.USE_SCGR = False  # V56: Spectral-Curvature refinement (replaces ring conv)
-_C.MODEL.TRANSFORMER.GCR.SCGR_SEMANTIC_GATE = False  # V3: semantic gate proven harmful in combos, default off
-_C.MODEL.TRANSFORMER.GCR.SCGR_USE_SCALAR_CURVATURE = False  # SDA: True→v1 scalar curvature gate (high-P); False→v2.1 Frenet
-
-# V41: SFA alignment loss pathway detach
-# When True, the feat_proj used by loss_sfa_align is detached → alignment loss
-# trains semantic_proj params only, does NOT shape h_cur → preserves GCR's
-# indirect P improvement (GCR-only P=91.84). semantic_logit injection (path A)
-# remains attached so classification bonus still shapes h_cur via cls loss.
-_C.MODEL.TRANSFORMER.SFA_ALIGN_DETACH = False
-
-_C.MODEL.TRANSFORMER.MATCH_DECOUPLE = False
-
-# V49: Selective matching decoupling.
-# When MATCH_DECOUPLE=True:
-#   MATCH_DECOUPLE_SFA=True  (default, v47): decouple BOTH cls (SFA) and coord (GCR) from matching
-#   MATCH_DECOUPLE_SFA=False (v49): decouple ONLY coord (GCR); SFA-enhanced cls participates in matching
-# Rationale: SFA's semantic prior improves matching (R↑), while GCR's correction causes over-matching (P↓).
-# Keeping SFA in matching + GCR out creates synergy: better matching → cleaner GCR training targets.
-_C.MODEL.TRANSFORMER.MATCH_DECOUPLE_SFA = True
-
-
-
-
+_C.MODEL.TRANSFORMER.GCR.CLS_BONUS = False
+_C.MODEL.TRANSFORMER.GCR.NUM_LAYERS = 1
+_C.MODEL.TRANSFORMER.GCR.COORD_ONLY = False
+_C.MODEL.TRANSFORMER.GCR.USE_ATTENTION = False
 
 _C.MODEL.TRANSFORMER.LOSS = CN()
 _C.MODEL.TRANSFORMER.LOSS.AUX_LOSS = True
@@ -470,11 +466,7 @@ _C.MODEL.TRANSFORMER.LOSS.POINT_VAR_WEIGHT = 0.0  # V10: regression uncertainty 
 _C.MODEL.TRANSFORMER.LOSS.CLS_VAR_WEIGHT = 0.0    # V11: classification uncertainty (0 = off)
 _C.MODEL.TRANSFORMER.LOSS.REG_VAR_NEG_WEIGHT = 0.0  # V11: negative-sample reg uncertainty (0 = off)
 _C.MODEL.TRANSFORMER.LOSS.REG_VAR_NEG_TARGET = 0.0  # V11: negative-sample reg log_var target
-_C.MODEL.TRANSFORMER.LOSS.SFA_ALIGN_WEIGHT = 0.5    # V15: SFA alignment loss weight
-_C.MODEL.TRANSFORMER.LOSS.SFA_BG_MARGIN = 0.1       # V22: hinge margin for bg contrastive (push bg cos_sim < margin)
-_C.MODEL.TRANSFORMER.LOSS.SFA_ALIGN_BG_WEIGHT = 0.1 # V22: bg contrastive loss weight
-_C.MODEL.TRANSFORMER.LOSS.AUX_ENSEMBLE_LAYERS = 3   # V11: aux ensemble layers
-# (LAIR-related loss configs removed)
+_C.MODEL.TRANSFORMER.LOSS.AUX_ENSEMBLE_LAYERS = 3
 
 
 _C.SOLVER.OPTIMIZER = "ADAMW"

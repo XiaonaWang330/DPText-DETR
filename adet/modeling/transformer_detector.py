@@ -13,6 +13,10 @@ from adet.modeling.dptext_detr.matcher import build_matcher
 from adet.modeling.dptext_detr.models import DPText_DETR
 from adet.utils.misc import NestedTensor, box_xyxy_to_cxcywh
 
+# CLIP input normalization constants (RGB, range [0, 1])
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
 
 class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
@@ -133,11 +137,6 @@ class TransformerPureDetector(nn.Module):
         enc_losses = ['labels', 'boxes']
         dec_losses = ['labels', 'ctrl_points']
 
-        # V13: SFA alignment loss
-        if self.dptext_detr.use_sfa:
-            dec_losses.append('sfa_align')
-            weight_dict['loss_sfa_align'] = loss_cfg.get('SFA_ALIGN_WEIGHT', 0.5)
-
         self.criterion = SetCriterion(
             self.dptext_detr.num_classes,
             box_matcher,
@@ -148,9 +147,6 @@ class TransformerPureDetector(nn.Module):
             self.dptext_detr.num_ctrl_points,
             focal_alpha=loss_cfg.FOCAL_ALPHA,
             focal_gamma=loss_cfg.FOCAL_GAMMA,
-            sfa_module=self.dptext_detr.sfa if self.dptext_detr.use_sfa else None,
-            bg_margin=loss_cfg.get('SFA_BG_MARGIN', 0.1),
-            bg_weight=loss_cfg.get('SFA_ALIGN_BG_WEIGHT', 0.1),
         )
 
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
@@ -165,6 +161,16 @@ class TransformerPureDetector(nn.Module):
         images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
         images = ImageList.from_tensors(images)
         return images
+
+    def _get_clip_images(self, batched_inputs):
+        """
+        Extract raw image tensors for CLIP processing.
+        These are geometrically transformed (resize/crop/flip) but NOT detector-normalized.
+        Returns a list of (3, H, W) tensors, or None if no CLIP module is active.
+        """
+        if not (self.dptext_detr.use_clip or self.dptext_detr.use_tgsr):
+            return None
+        return [x["image"].to(self.device) for x in batched_inputs]
 
     def forward(self, batched_inputs):
         """
@@ -190,10 +196,11 @@ class TransformerPureDetector(nn.Module):
                 "scores", "pred_classes", "polygons"
         """
         images = self.preprocess_image(batched_inputs)
+        clip_images = self._get_clip_images(batched_inputs)
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets = self.prepare_targets(gt_instances) # cls、coord、bbox
-            output = self.dptext_detr(images)
+            output = self.dptext_detr(images, clip_images=clip_images)
             # compute the loss
             loss_dict = self.criterion(output, targets)
             weight_dict = self.criterion.weight_dict
@@ -202,12 +209,11 @@ class TransformerPureDetector(nn.Module):
                     loss_dict[k] *= weight_dict[k]
             return loss_dict
         else:
-            output = self.dptext_detr(images)
+            output = self.dptext_detr(images, clip_images=clip_images)
             ctrl_point_cls = output["pred_logits"]
             ctrl_point_coord = output["pred_ctrl_points"]
-            sem_cos = output.get("sem_cos", None)
 
-            results = self.inference(ctrl_point_cls, ctrl_point_coord, images.image_sizes, sem_cos=sem_cos)
+            results = self.inference(ctrl_point_cls, ctrl_point_coord, images.image_sizes)
             processed_results = []
             for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
                 height = input_per_image.get("height", image_size[0])
@@ -233,7 +239,7 @@ class TransformerPureDetector(nn.Module):
             )
         return new_targets
 
-    def inference(self, ctrl_point_cls, ctrl_point_coord, image_sizes, sem_cos=None):
+    def inference(self, ctrl_point_cls, ctrl_point_coord, image_sizes):
         assert len(ctrl_point_cls) == len(image_sizes)
         results = []
 

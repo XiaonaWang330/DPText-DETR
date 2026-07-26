@@ -17,7 +17,6 @@ V9: First CLIP integration. c_lang provides a global text-concept signal,
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import CLIPTextModel
 
 
 class CLIPLanguagePrior(nn.Module):
@@ -45,6 +44,7 @@ class CLIPLanguagePrior(nn.Module):
         self.num_ctrl_points = num_ctrl_points
 
         # ---- Frozen CLIP text encoder ----
+        from transformers import CLIPTextModel
         load_source = clip_model_path if clip_model_path else clip_model_name
         self.clip_text_model = CLIPTextModel.from_pretrained(load_source)
         clip_dim = self.clip_text_model.config.hidden_size  # 512

@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------- #
+# Experiment: DRTP-v2 + TACT + train-only token mixing (λ=0.1)
+# ---------------------------------------------------------------------------- #
+# Purpose: Partial CLIP token mixing as training regularization.
+#   Training: 90% aligned + 10% shuffled → prevent overfitting to exact
+#             patch correspondence while preserving dominant spatial structure.
+#   Inference: 100% aligned (deterministic, no overhead).
+#
+# Hypothesis: λ=0.1 gives enough perturbation to recover 0.3-0.5 R without
+#             killing P → F1 > 88.50.
+#
+# Baseline: DRTP-v2+TACT = 90.70 / 86.31 / 88.45
+# Target:   P ≈ 90.5-90.8, R ≈ 86.5-86.8, F1 ≥ 88.50
+# ---------------------------------------------------------------------------- #
+# Per guidance: single λ=0.1 only — no hyperparameter sweep.
+# If F1 < 88.45 → stop; adopt DRTP-v2+TACT=88.45 as final.
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+    USE_TACT: True
+    TACT_USE_CURA: False
+
+    # ── DRTP_v2: CLIP Dense Fusion ──
+    USE_CLIP: True
+    CLIP_DENSE_FUSION: True
+    CLIP_SHUFFLE: False
+
+    # ── NEW: train-only partial token mixing ──
+    CLIP_TOKEN_MIX: True
+    CLIP_TOKEN_MIX_LAMBDA: 0.1
+
+    CLIP_PROMPT_GATE: False
+    CLIP_QUERY_FUSION: False
+    CLIP_BACKBONE: "ViT-B-16"
+    CLIP_PRETRAINED: "pretrain/clip-vit-base-patch16"
+    CLIP_FREEZE: True
+    CLIP_GATE_INIT: 0.0
+    CLIP_DROPOUT: 0.0
+    CLIP_ALPHA_INIT: 0.5
+    CLIP_KEEP_ASPECT: True
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/drtp_v2_tact_mix_A100"

@@ -1,0 +1,246 @@
+================================================================================
+              SAG (Scale-Aware Gate) — 尺度感知门控 = DRTP-v2.2
+================================================================================
+
+1. 模块概述（一句话）
+────────────────────────
+  在 P3-DRTP（GateNet + 可学习 α 残差注入）的基础上，新增 **尺度感知调制器
+  (Scale-Aware Modulator)**，让 CLIP 注入强度能根据当前图像的"尺度特征"
+  自适应调整 → 小文本占主导的图像自动降低 CLIP 注入量，避免 14×14 patch
+  在密集小字区域的噪声干扰。
+
+2. 与 baseline 的关系
+────────────────────────
+  baseline (纯视觉 Deformable DETR)
+    → P3-DRTP:  CLIP 视觉 + GateNet + α 注入
+    → SAG:      P3-DRTP + 尺度感知 α 调制 (per-image scale factor)
+
+  SAG = P3-DRTP + ScaleAwareModulator（仅作用于 P3 level 的 α）
+
+3. 子机制拆分
+────────────────────────
+  3.1 冻结 CLIP 视觉编码 (frozen, 与 P3-DRTP 共享)
+      - ViT-B/16: 12 layers, patch=16, dim=768
+      - 输入 224×224 → 14×14 patch grid → 196 tokens
+      - 输出: patch_tokens (B, 196, 768)
+      - 上采样到 P3 分辨率 (B, 768, H/8, W/8)
+
+  3.2 CLIP 特征投影 (level_projectors[0])
+      - Conv2d(768, 256, k=1) + GroupNorm(32, 256)
+      - CLIP patch tokens → 256-dim feature map, 对齐 P3 空间
+
+  3.3 尺度感知调制器 (ScaleAwareModulator) ★ SAG 核心创新
+      - 输入: 当前 level 的 backbone 特征 src (B, 256, H, W)
+      - AdaptiveAvgPool2d(1) → (B, 256, 1, 1)
+      - Flatten → (B, 256)
+      - Linear(256→64) → ReLU
+      - Linear(64→1) → Sigmoid → scale_factor ∈ (0, 1)
+      - 初始化 bias=2.0 → sigmoid(2)≈0.88 → 训练起点接近恒等变换
+      - effective_alpha = base_alpha × scale_factor
+
+  3.4 Gate 调制 (GateNet, 标准卷积版)
+      - 输入: concat(src_norm, V_norm) → (B, 512, H, W)
+      - Conv2d(512, 256, k=1) → ReLU
+      - Conv2d(256, 64, k=1) → ReLU
+      - Conv2d(64, 1, k=1) → gate_logits
+      - G = sigmoid(gate_logits) × mask_valid
+
+  3.5 残差融合 (Fusion)
+      - residual = effective_alpha × G × V
+      - F_new = src + residual
+
+4. 完整架构图（注入点 + 信号流）
+────────────────────────
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                         SAG 信号流                               │
+  │                                                                 │
+  │  Input Image                    CLIP Image (224×224)             │
+  │      │                              │                           │
+  │  ┌───▼────────────┐          ┌─────▼──────────────┐             │
+  │  │ ResNet-50 FPN  │          │ Frozen CLIP ViT-B  │             │
+  │  │ P3/P4/P5/P6    │          │ (12 layers, eval)  │             │
+  │  └───┬────────────┘          └─────┬──────────────┘             │
+  │      │ input_proj                   │ patch_tokens (196, 768)   │
+  │      │ Conv1×1+GN                    │ upsample→P3 res            │
+  │      ▼                               ▼                           │
+  │  src[0] (B,256,H,W)          clip_feat_2d (B,768,H,W)            │
+  │      │                               │                           │
+  │      │    ┌──────────────────────────┘                           │
+  │      │    │                                                       │
+  │      │    ▼                                                       │
+  │      │  ┌─────────────────────────────────────────────┐         │
+  │      │  │ ScaleAwareModulator(src[0])                  │         │
+  │      │  │  AvgPool → Linear(256→64) → ReLU             │         │
+  │      │  │  → Linear(64→1) → Sigmoid → scale ∈ (0,1)   │         │
+  │      │  └──────────────┬──────────────────────────────┘         │
+  │      │                 │                                         │
+  │      │  ┌──────────────▼──────────────────────────────┐         │
+  │      │  │ effective_alpha = base_alpha × scale         │         │
+  │      │  └──────────────┬──────────────────────────────┘         │
+  │      │                 │                                         │
+  │      │  ┌──────────────▼──────────────────────────────┐         │
+  │      │  │ level_projectors[0](clip_feat_2d)            │         │
+  │      │  │  Conv1×1(768→256)+GN → V (B,256,H,W)        │         │
+  │      │  └──────────────┬──────────────────────────────┘         │
+  │      │                 │                                         │
+  │      │  ┌──────────────▼──────────────────────────────┐         │
+  │      │  │ GateNet(concat(LN(src), LN(V)))              │         │
+  │      │  │  → gate_logits → G = sigmoid(gate_logits)    │         │
+  │      │  └──────────────┬──────────────────────────────┘         │
+  │      │                 │                                         │
+  │      │  ┌──────────────▼──────────────────────────────┐         │
+  │      │  │ residual = effective_alpha × G × V           │         │
+  │      │  │ F_new = src + residual                       │         │
+  │      │  └──────────────┬──────────────────────────────┘         │
+  │      │                 │                                         │
+  │      ▼                 ▼                                         │
+  │  ┌───────────────────────────────────────────┐                  │
+  │  │ srcs[0] = F_new  → Transformer Encoder      │                  │
+  │  │ srcs[1..3] = pass-through (no CLIP fusion)  │                  │
+  │  └───────────────────────────────────────────┘                  │
+  │                                                                 │
+  │  注入点: P3 only (level=0, stride=8)                             │
+  │  P4/P5/P6: identity pass-through (active_levels=[0])            │
+  └─────────────────────────────────────────────────────────────────┘
+
+5. 内部结构详情
+────────────────────────
+  5.1 Projector (level_projectors[0])
+      Conv2d(768, 256, k=1) + GroupNorm(32, 256)
+      CLIP patch tokens → 256-dim feature map
+
+  5.2 GateNet (level_gate_nets[0])
+      Conv2d(512, 256, k=1)  ← concat(src_norm, V_norm)
+      ReLU
+      Conv2d(256, 64, k=1)
+      ReLU
+      Conv2d(64, 1, k=1)     ← output: gate_logits
+      bias init = 0.0
+
+  5.3 ScaleAwareModulator (scale_modulators[0]) ★
+      AdaptiveAvgPool2d(1) → Flatten
+      → Linear(256, 64) → ReLU
+      → Linear(64, 1) → Sigmoid
+      bias init = 2.0（sigmoid(2.0)≈0.88，训练起点接近恒等）
+
+  5.4 α (level_alphas[0])
+      nn.Parameter, init=0.5, learnable
+      控制 CLIP 特征注入的全局幅度
+
+6. 物理直觉
+────────────────────────
+  原文: 小文本密集图像中，CLIP 的 14×14 patch 由于感受野过大，
+         会把多个小字混合成一个 patch → 特征噪声大 → 注入有害
+  反文: 正常尺度文本，CLIP patch 与文本区域对齐良好 → 注入有益
+  实现: ScaleAwareModulator 读取 backbone 的全局平均池化特征
+        → 若该特征"指示小文本主导"（尺度统计异常）→ scale<1
+        → effective_alpha = α × scale 自动下降 → CLIP 注入减弱
+        scale 从 0.88 起步（接近恒等），随训练学会区分图像尺度
+
+7. 参数量统计
+────────────────────────
+  组件                    │ 参数量     │ 可训练? │ 初始化
+  ────────────────────────┼───────────┼────────┼──────────
+  CLIP ViT-B/16           │ 86M        │ frozen  │ pretrained
+  Projector (P3 only)     │ 768×256=197K│ ✓      │ default
+  GateNet (P3 only)       │ ~198K      │ ✓      │ default+bias=0
+  α (P3 only)             │ 1          │ ✓      │ 0.5
+  ScaleAwareModulator     │ 256×64+64+64×1+1 ≈ 16K │ ✓ │ bias=2.0
+  ────────────────────────┼───────────┼────────┼──────────
+  总计可训练 (adapter)     │ ~411K      │        │
+
+8. Tensor Shape 追踪
+────────────────────────
+  Stage                        │ Shape
+  ─────────────────────────────┼────────────────────────────
+  clip_images                   │ list of (3, H_i, W_i) × B
+  → preprocess (224×224)        │ (B, 3, 224, 224)
+  → CLIP ViT output             │ (B, 197, 768)  [1 CLS + 196 patch]
+  → patch_tokens (drop CLS)     │ (B, 196, 768)
+  → reshape to 2D               │ (B, 768, 14, 14)
+  → interpolate to P3           │ (B, 768, H/8, W/8)
+  ───────── project ────────────┼────────────────────────────
+  clip_feat_2d                  │ (B, 768, H/8, W/8)
+  → level_projectors[0]         │ (B, 256, H/8, W/8)  ← V
+  ───────── gate branch ────────┼────────────────────────────
+  src_norm = LN(src[0])         │ (B, 256, H/8, W/8)
+  V_norm = LN(V)                │ (B, 256, H/8, W/8)
+  concat(src_norm, V_norm)      │ (B, 512, H/8, W/8)
+  → GateNet                     │ (B, 1, H/8, W/8)
+  → G = sigmoid(...)            │ (B, 1, H/8, W/8), range [0,1]
+  ───────── scale-aware ────────┼────────────────────────────
+  AvgPool(src[0])               │ (B, 256, 1, 1)
+  → MLP → Sigmoid               │ (B, 1, 1, 1)  ← scale_factor
+  effective_alpha = α × scale   │ (B, 1, 1, 1)
+  ───────── fusion ─────────────┼────────────────────────────
+  residual = effective_alpha*G*V│ (B, 256, H/8, W/8)
+  F_new = src + residual        │ (B, 256, H/8, W/8) → 输出
+  ─────────────────────────────┼────────────────────────────
+  P4/P5/P6 levels               │ identity: src = src (active_levels=[0])
+
+9. 配置开关 (R_50_poly_drtp_scale_aware_A100.yaml)
+────────────────────────
+  CLIP_ACTIVE_LEVELS:        [0]         # 仅 P3 注入
+  CLIP_USE_GATE:             True        # 保留 GateNet
+  CLIP_LEARNABLE_ALPHA:      True        # α 可学习
+  CLIP_ALPHA_INIT:           0.5
+  CLIP_SCALE_AWARE_GATE:     True        # ★ 启用尺度感知调制
+  CLIP_SHARED_PROJECTOR:     False
+  CLIP_DIRECTIONAL_GATE:     False       # 标准 GateNet
+  CLIP_FREEZE:               True        # CLIP 冻结
+  CLIP_KEEP_ASPECT:          True
+  GCR / TGSR / TACT:         False       # 均关闭
+
+10. 与 P3-DRTP 的关键差异
+────────────────────────
+  对比维度         │ P3-DRTP                │ SAG (v2.2)
+  ────────────────┼───────────────────────┼──────────────────────
+  CLIP 编码        │ ViT vision only        │ ViT vision only
+  可学习参数        │ Projector+GateNet+α   │ 同上 + ScaleAwareModulator
+  α 控制           │ 固定 0.5 (或标量学习)  │ α × scale(backbone)
+  scale 调制       │ 无                      │ ScaleAwareModulator
+  小文本处理      │ 统一 α，可能过注入噪声  │ scale↓ → α↓ → 抑制噪声
+  正常文本处理    │ 统一 α，注入稳定        │ scale≈1 → 保持注入
+  训练起点        │ GateNet from scratch    │ = P3-DRTP (scale=0.88)
+
+11. 设计哲学与教训
+────────────────────────
+  动机: DRTP-v2 在小文本上失败 → CLIP 14×14 patch 对小字噪声大
+        需要让模型学会"什么时候少注入 CLIP"
+  期望: 小文本图像 Recall↑, 正常文本图像保持 P/R
+  实现: ScaleAwareModulator 读 backbone 全局统计 → 预测 scale∈(0,1)
+        → 图像级（非空间级）调制 α
+  与 MM-P3 区别: MM-P3 用文本相似度 (CLIP text encoder) 做空间门控；
+                SAG 只用视觉 backbone 统计做图像级 α 缩放，
+                不引入额外文本编码器，更轻量
+
+================================================================================
+                          — END: SAG Architecture Analysis —
+================================================================================
+
+================================================================================
+             SAG (Scale-Aware Gate) 可视化分析 (200张 CTW1500 Test)
+================================================================================
+
+1. 可视化目标
+────────────────────────
+  验证 CLIP 特征注入对 P3 检测特征的真实影响：
+  - 左下图: Pre-CLIP P3 Feature (channel mean) + GT
+  - 右下图: CLIP Delta |post-pre| + GT (黄色=CLIP 改变区域)
+
+2. 当前发现（vis_sag_v3）
+────────────────────────
+  - diff ratio (||post-pre|| / ||pre||) ≈ 0.30
+    → CLIP 确实在改变约 30% 的特征能量
+  - 文字区域（GT polygon 内）出现明显 Delta 高激活
+  - 背景区域 Delta 接近 0 → CLIP gate 正确抑制了背景噪声
+
+3. 待验证问题
+────────────────────────
+  - 小文本图像: scale_factor 是否确实 < 0.88？
+  - 大文本图像: scale_factor 是否 ≈ 0.88~1.0？
+  - ScaleAwareModulator 是否学到了有意义的尺度区分？
+
+================================================================================
+                     — END: SAG Visualization Analysis —
+================================================================================

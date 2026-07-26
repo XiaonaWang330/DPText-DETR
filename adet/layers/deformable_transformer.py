@@ -8,6 +8,7 @@
 # ------------------------------------------------------------------------
 import copy
 import math
+import torch.utils.checkpoint as checkpoint
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -42,7 +43,7 @@ class DeformableTransformer_Det(nn.Module):
             efsa=False,
             use_clip_lang_prior=False,
             enhance=False,
-            satr_module=None,
+            tact_module=None,
     ):
         super().__init__()
 
@@ -71,7 +72,7 @@ class DeformableTransformer_Det(nn.Module):
             dec_n_points,
             efsa,
             use_clip_lang_prior=use_clip_lang_prior,
-            satr_module=satr_module,
+            tact_module=tact_module,
         )
         self.decoder = DeformableTransformerDecoder_Det(
             decoder_layer,
@@ -214,7 +215,7 @@ class DeformableTransformer_Det(nn.Module):
             mask_flatten
         )
 
-        # V48: expose encoder memory + spatial_shapes for SFA v2 (encoder-level RoI pooling)
+        # V48: expose encoder memory + spatial_shapes
         self.enc_memory = memory
         self.enc_spatial_shapes = spatial_shapes
 
@@ -251,7 +252,7 @@ class DeformableTransformer_Det(nn.Module):
             query_pos=query_pos if not self.epqm else None,
             src_padding_mask=mask_flatten,
             c_lang=c_lang,
-            v_spatial=v_spatial
+            v_spatial=v_spatial,
         )
         inter_references_out = inter_references
 
@@ -379,13 +380,13 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
             n_points=4,
             efsa=False,
             use_clip_lang_prior=False,
-            satr_module=None,
+            tact_module=None,
     ):
         super().__init__()
 
         self.efsa = efsa
         self.use_clip_lang_prior = use_clip_lang_prior
-        self.satr = satr_module
+        self.tact = tact_module
 
         # cross attention
         self.attn_cross = MSDeformAttn(d_model, n_levels, n_heads, n_points)
@@ -453,6 +454,7 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
             src_padding_mask=None,
             c_lang=None,
             v_spatial=None,
+            clip_patches=None,
     ):
         # input size
         # - tgt:        (bs, n_q, n_pts, dim)
@@ -461,7 +463,7 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
         # =================================================================
         # 1. intra-group self-attention (EFSA or standard)
         # =================================================================
-        sigma = None  # SATR scale factor
+        sigma = None  # TACT scale factor
 
         if self.efsa:
             shortcut = tgt
@@ -474,23 +476,23 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
 
             tgt_circonv = self.drop_path(self.circonv(shortcut + query_pos))
 
-            # --- SATR / CURA: geometry refinement ---
+            # --- TACT: topology-aware curvature transform ---
             film_scale = None
-            if self.satr is not None:
+            if self.tact is not None:
                 ref_pts = reference_points
                 if ref_pts.dim() == 5:
                     ref_pts = ref_pts[:, :, :, 0, :]   # (B, N, 16, 2)
                 assert ref_pts.shape[:3] == shortcut.shape[:3], \
-                    (f"SATR shape mismatch: ref_pts{tuple(ref_pts.shape)} "
+                    (f"TACT shape mismatch: ref_pts{tuple(ref_pts.shape)} "
                      f"vs shortcut{tuple(shortcut.shape)}. "
                      f"reference_points{tuple(reference_points.shape)}")
-                gauss_feat, film_scale = self.satr(
+                gauss_feat, film_scale = self.tact(
                     shortcut, ref_pts
                 )
                 tgt_intra = tgt_intra + gauss_feat
 
-            if self.satr is not None and film_scale is not None:
-                tgt_circonv = self.satr.forward_film_circonv(
+            if self.tact is not None and film_scale is not None:
+                tgt_circonv = self.tact.forward_film_circonv(
                     tgt_circonv, film_scale
                 )
 
@@ -544,7 +546,7 @@ class DeformableTransformerDecoderLayer_Det(nn.Module):
         # =================================================================
         tgt = self.forward_ffn(tgt)
 
-        # ---- V12: post-FFN sigmoid gate + spatial injection (V9 proven, targets Precision) ----
+        # ---- CLIP lang prior: post-FFN sigmoid gate + spatial injection ----
         # gamma: per-channel gate ∈ [0,1] — "how much spatial info to add"
         # v_spatial: per-point signal — "what spatial info to add"
         # Global control + spatial content, granularity matched (finding #5, #6)
@@ -607,7 +609,7 @@ class DeformableTransformerDecoder_Det(nn.Module):
             query_pos=None,
             src_padding_mask=None,
             c_lang=None,
-            v_spatial=None
+            v_spatial=None,
     ):
         output = tgt  # bs, n_q, n_pts, 256
         if self.epqm:

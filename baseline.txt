@@ -1,0 +1,129 @@
+输入图片 (B, 3, H, W)
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│  ① Backbone: ResNet-50 (MaskedBackbone)                    │
+│     → 3层多尺度特征: res3(stride8), res4(stride16), res5(stride32) │
+│     → channels: [512, 1024, 2048]                          │
+│     → 附带 padding mask                                    │
+└────────────────────────────────────────────────────────────┘
+        │ + PositionalEncoding2D (sin/cos, 每层256维)
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│  ② Input Projection: 1×1 Conv + GroupNorm → 统一到 256维   │
+│     Layer 0: stride=8,  c_in=512  → 1×1 conv → 256        │
+│     Layer 1: stride=16, c_in=1024 → 1×1 conv → 256        │
+│     Layer 2: stride=32, c_in=2048 → 1×1 conv → 256        │
+│     Layer 3: stride=64, 额外生成(3×3 stride=2 on layer2)    │
+│     → srcs: [ (B,256,H/8,W/8), ..., (B,256,H/64,W/64) ]   │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│  ③ DeformableTransformer_Det (编码器 + 解码器)              │
+│                                                             │
+│  【编码器 6层】                                              │
+│   每层: MSDeformAttn(self-attn, 8head, 4pts/lvl) → FFN     │
+│   输入: (B, ∑HW, 256)  →  输出: memory (B, ∑HW, 256)       │
+│                                                             │
+│  【编码器输出处理】 gen_encoder_output_proposals:             │
+│   memory → bbox_class (逐点分类) + bbox_embed (bbox回归)     │
+│   → TopK=100 最高分 → init_reference (B,100,4) [cx,cy,w,h] │
+│                                                             │
+│  【控制点初始化】 init_control_points_from_anchor:            │
+│   将 bbox 转为 16点闭合多边形:                                │
+│   上边8个点 (左→右) + 下边8个点 (右→左)                      │
+│   → reference (B, 100, 16, 2)                              │
+│                                                             │
+│  【解码器 6层】                                              │
+│   每层:                                                      │
+│     ① 组内自注意力 (16点之间)                                │
+│     ② 组间自注意力 (100个query之间)                          │
+│     ③ 可变形交叉注意力 (query↔encoder memory, 4pts/lvl)      │
+│     ④ FFN (256→1024→256)                                   │
+│   → hs: (6层, B, 100, 16, 256)                             │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│  ④ 输出头 (每 decoder 层循环)                               │
+│                                                             │
+│  for lvl in 0..5:                                          │
+│    h_cur = hs[lvl]                          (B,100,16,256) │
+│    │                                                        │
+│    ├─ cls_head: Linear(256→1) → (B,100,16,1)  分类 logit  │
+│    ├─ reg_head: MLP(256→256→256→2) → (B,100,16,2)  偏移量  │
+│    │                                                        │
+│    ├─ tmp += reference (残差加到初始参考点)                   │
+│    └─ sigmoid → 输出坐标 [0,1]                               │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+输出:
+    pred_logits:      (B, 100, 16, 1)  ← 最后一层
+    pred_ctrl_points: (B, 100, 16, 2)  ← 最后一层
+    aux_outputs:      [前5层] (aux loss)
+    enc_outputs:      { pred_logits, pred_boxes } (编码器输出)
+
+
+═══════════════════════════════════════════════════════════════
+Tensor 形状追踪
+═══════════════════════════════════════════════════════════════
+
+图片:  (B, 3, H, W)           H,W 约 640×640
+   ↓ Backbone
+srcs:  [(B,256,80,80), (B,256,40,40), (B,256,20,20), (B,256,10,10)]
+           stride=8       stride=16      stride=32      stride=64
+   ↓ flatten
+memory: (B, ∑HW, 256) = (B, 8500, 256)    (80²+40²+20²+10²≈8500)
+   ↓ Encoder(6层, self-attn)
+memory: (B, 8500, 256)
+   ↓ gen_encoder_output_proposals
+init_reference: (B, 100, 4)   [cx,cy,w,h]  归一化到[0,1]
+   ↓ init_control_points → 16点
+reference: (B, 100, 16, 2)
+
+   ↓ Decoder(6层)
+tgt: (B, 100, 16, 256)   ← Embedding(16, 256)
+  每层:
+    intra-self-attn (16→16组内)     → (B,100,16,256)
+    inter-self-attn (100→100组间)   → (B,100,16,256)
+    cross-attn (可变形, 4pts/lvl)   → (B,100,16,256)
+    FFN (256→1024→256)             → (B,100,16,256)
+
+hs: (6, B, 100, 16, 256)    ← 6个decoder层的输出
+
+
+═══════════════════════════════════════════════════════════════
+Loss 体系
+═══════════════════════════════════════════════════════════════
+
+匹配: Hungarian Matcher (点级匹配，基于 cls score + coord L1)
+匹配后 indices → 确定哪些 query 对应哪个 GT
+
+Decoder 损失:
+├─ loss_ce: Focal Loss (每个控制点的二分类: text/not-text)
+│    输入: pred_logits (B,100,16,1) vs targets
+│    权重: POINT_CLASS_WEIGHT
+│
+└─ loss_ctrl_points: L1 Loss (控制点坐标回归)
+     输入: pred_ctrl_points (B,100,16,2) vs targets
+     权重: POINT_COORD_WEIGHT
+
+Encoder 损失:
+├─ loss_ce: Focal Loss (编码器proposal分类)
+├─ loss_bbox: L1 Loss (bbox回归)
+└─ loss_giou: GIoU Loss (bbox质量)
+
+AUX Loss: 前5层decoder + encoder → 各乘相同权重
+
+
+═══════════════════════════════════════════════════════════════
+Baseline 性能 (CTW1500)
+═══════════════════════════════════════════════════════════════
+
+P=90.95  R=84.90  F1=87.82
+
+瓶颈: R 仅 84.90 → 15% 文本漏检
+根因: reg_head 和 cls_head 共享 decoder 输出的 256 维 h_cur，
+      两者梯度方向冲突，256 维不足以同时服务分类和回归。

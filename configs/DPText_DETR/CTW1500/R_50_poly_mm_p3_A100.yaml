@@ -1,0 +1,94 @@
+# ---------------------------------------------------------------------------- #
+# [E2] MM-P3: Text-Conditioned P3-DRTP
+# ---------------------------------------------------------------------------- #
+# Purpose: Test whether explicit CLIP text prompts provide incremental value
+#   over vision-only P3-DRTP.
+#
+# Architecture:
+#   F'_3 = F_3 + alpha_3 * sigmoid( GateNet_logits + rho * textness ) * V_3
+#
+# Key design:
+#   - rho = 0 at init → training step 0 == P3-DRTP exactly.
+#   - textness = (sim(patch, positive) - sim(patch, negative)) / tau → signed margin.
+#   - Prompt ensemble: 5 templates → averaged normalized prototypes.
+#   - CLIP frozen, text prototypes are pre-computed buffers.
+#
+# Baseline (P3, seed=42):
+#   P=91.38 R=85.57 F1=88.38 AP50=82.19 AP50:95=61.80
+#
+# Success criteria:
+#   F1 ≥ 88.38  AND  AP50:95 ≥ 61.80 - 0.1
+#   Ideal: F1 > 88.38 AND AP50:95 > 61.80
+# ---------------------------------------------------------------------------- #
+_BASE_: "../Base.yaml"
+
+SEED: 42
+
+DATASETS:
+  TRAIN: ("ctw1500_poly_train_rotate_pos",)
+  TEST: ("ctw1500_poly_test",)
+
+MODEL:
+  WEIGHTS: "pretrain.pth"
+  GA_STEPS: 1
+  TRANSFORMER:
+    USE_CLIP_LANG_PRIOR: False
+
+    # ── P3-DRTP (CLIP → P3 only) ──
+    USE_CLIP: True
+    CLIP_DENSE_FUSION: True
+    CLIP_PROMPT_GATE: False
+    CLIP_QUERY_FUSION: False
+    CLIP_BACKBONE: "ViT-B-16"
+    CLIP_PRETRAINED: "pretrain/clip-vit-base-patch16"
+    CLIP_FREEZE: True
+    CLIP_GATE_INIT: 0.0
+    CLIP_DROPOUT: 0.0
+    CLIP_ALPHA_INIT: 0.5
+    CLIP_KEEP_ASPECT: True
+    CLIP_ACTIVE_LEVELS: [0]        # P3 only
+
+    # ── MM-P3: Text-conditioned gate ──
+    CLIP_TEXT_GATE: True
+    CLIP_TEXT_GATE_LEVEL: 0          # modulate P3 gate
+    CLIP_TEXT_GATE_SCALE_INIT: 0.0   # zero-init → exact P3 at step 0
+    CLIP_TEXT_TEMPERATURE: 0.07
+    CLIP_TEXTNESS_CLAMP: 10.0
+
+    CLIP_POSITIVE_PROMPTS:
+      - "a photo of text"
+      - "a region containing written text"
+      - "printed or handwritten characters"
+      - "words in a natural scene"
+      - "scene text"
+
+    CLIP_NEGATIVE_PROMPTS:
+      - "a background region without text"
+      - "a non-text object"
+      - "natural scenery without writing"
+      - "texture without readable characters"
+      - "a region containing no text"
+
+    # ── No TACT ──
+    USE_TACT: False
+
+SOLVER:
+  IMS_PER_BATCH: 8
+  BASE_LR: 2e-5
+  LR_BACKBONE: 2e-6
+  WARMUP_ITERS: 0
+  STEPS: (100000,)
+  MAX_ITER: 13000
+  CHECKPOINT_PERIOD: 1000
+
+INPUT:
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1280
+
+TEST:
+  EVAL_PERIOD: 1000
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/mm_p3_A100"

@@ -53,6 +53,72 @@ from adet.checkpoint import AdetCheckpointer
 from adet.evaluation import TextEvaluator,TextDetEvaluator
 
 
+class AdetBestCheckpointer(hooks.BestCheckpointer):
+    """
+    Same as BestCheckpointer, but:
+    1. Persists best_metric + best_iter in the checkpoint so it survives resume.
+    2. Restores best_metric from existing model_best.pth on before_train().
+
+    Without this, resume always starts with best_metric=None, and model_best
+    is overwritten by whatever happens to be best AFTER resume — the true
+    best from the initial training run is silently lost.
+    """
+
+    def before_train(self):
+        """Restore best_metric from an existing model_best.pth if resuming."""
+        best_path = os.path.join(self._checkpointer.save_dir, f"{self._file_prefix}.pth")
+        if os.path.exists(best_path):
+            try:
+                ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+                saved_metric = ckpt.get(self._val_metric, None)
+                saved_iter = ckpt.get("iteration", None)
+                if saved_metric is not None:
+                    self.best_metric = saved_metric
+                    self.best_iter = saved_iter
+                    self._logger.info(
+                        f"Restored best metric from previous run: "
+                        f"{self._val_metric}={self.best_metric:.5f} @ iter={self.best_iter}"
+                    )
+            except Exception as e:
+                self._logger.warning(f"Failed to restore best metric: {e}")
+
+    def _best_checking(self):
+        """Override to also persist best_metric in the checkpoint."""
+        # put_scalar() simultaneously writes _latest_scalars, so
+        # storage.latest() is immediately up-to-date after EvalHook.
+        metric_tuple = self.trainer.storage.latest().get(self._val_metric)
+        if metric_tuple is None:
+            self._logger.warning(
+                f"Given val metric {self._val_metric} does not seem to be computed/stored."
+                "Will not be checkpointing based on it."
+            )
+            return
+        else:
+            latest_metric, metric_iter = metric_tuple
+
+        if self.best_metric is None:
+            if self._update_best(latest_metric, metric_iter):
+                additional_state = {"iteration": metric_iter, self._val_metric: latest_metric}
+                self._checkpointer.save(f"{self._file_prefix}", **additional_state)
+                self._logger.info(
+                    f"Saved first model at {self.best_metric:0.5f} @ {self.best_iter} steps"
+                )
+        elif self._compare(latest_metric, self.best_metric):
+            additional_state = {"iteration": metric_iter, self._val_metric: latest_metric}
+            self._checkpointer.save(f"{self._file_prefix}", **additional_state)
+            self._logger.info(
+                f"Saved best model as latest eval score for {self._val_metric} is "
+                f"{latest_metric:0.5f}, better than last best score "
+                f"{self.best_metric:0.5f} @ iteration {self.best_iter}."
+            )
+            self._update_best(latest_metric, metric_iter)
+        else:
+            self._logger.info(
+                f"Not saving as latest eval score for {self._val_metric} is {latest_metric:0.5f}, "
+                f"not better than best score {self.best_metric:0.5f} @ iteration {self.best_iter}."
+            )
+
+
 class EvalPeriodFinalCheckpointer(hooks.HookBase):
     """
     Save ``model_final_<iter>.pth`` after each evaluation period.
@@ -121,11 +187,14 @@ class Trainer(DefaultTrainer):
                     max_iter=self.max_iter
                 )
             elif isinstance(ret[i], hooks.EvalHook):
-                # Insert BestCheckpointer AFTER EvalHook so it can read freshly-stored metrics
-                ret.insert(i + 1, hooks.BestCheckpointer(
+                # Insert BestCheckpointer AFTER EvalHook so it can read freshly-stored metrics.
+                # DefaultTrainer.test() unwraps single-dataset results → "F1" not "dataset/F1".
+                # (Only with multiple TEST datasets does flatten_results_dict add the prefix.)
+                val_metric = "F1" if len(self.cfg.DATASETS.TEST) == 1 else f"{self.cfg.DATASETS.TEST[0]}/F1"
+                ret.insert(i + 1, AdetBestCheckpointer(
                     eval_period=self.cfg.TEST.EVAL_PERIOD,
                     checkpointer=self.checkpointer,
-                    val_metric="DET_RESULT/hmean",
+                    val_metric=val_metric,
                     mode="max",
                     file_prefix="model_best",
                 ))
@@ -198,6 +267,15 @@ class Trainer(DefaultTrainer):
         # Average accumulated loss values for logging
         if total_loss_dict is not None:
             total_loss_dict = {k: v / ga_steps for k, v in total_loss_dict.items()}
+
+        # Log MCGF CLIP monitoring metrics (clip/alpha_level_*, etc.)
+        _dptext_detr = getattr(_model, 'dptext_detr', _model)  # handle DDP
+        _clip_adapter = getattr(_dptext_detr, 'clip_adapter', None)
+        if _clip_adapter is not None:
+            _clip_stats = _clip_adapter.get_stats()
+            if _clip_stats:
+                for k, v in _clip_stats.items():
+                    _trainer.storage.put_scalar(k, v)
 
         _trainer.after_backward()
         _trainer._write_metrics(total_loss_dict, data_time)
