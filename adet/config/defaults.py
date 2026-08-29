@@ -342,19 +342,13 @@ _C.MODEL.TRANSFORMER = CN()
 _C.MODEL.TRANSFORMER.USE_POLYGON = False
 _C.MODEL.TRANSFORMER.ENABLED = True
 _C.MODEL.TRANSFORMER.INFERENCE_TH_TEST = 0.3
+# GQ: geometric quality sqrt re-ranking (pure post-process, no training change)
+_C.MODEL.TRANSFORMER.GQ_REORDER = False   # True = sqrt(base_score * geom_quality)
 # V11: dual-path uncertainty (disabled by default, set in per-experiment configs)
 _C.MODEL.TRANSFORMER.INFERENCE_CLS_UNC_WEIGHT = 0.0   # w_cls: 0 = off
 _C.MODEL.TRANSFORMER.INFERENCE_REG_UNC_WEIGHT = 0.0   # w_reg: 0 = off
 _C.MODEL.TRANSFORMER.INFERENCE_UNC_TEMP = 1.0
 _C.MODEL.TRANSFORMER.INFERENCE_AUX_ENSEMBLE = False
-
-# --------------------------------------------------------------------------- #
-# V12: Self-Guided Instance Feature Aggregation (SGIFA)
-# --------------------------------------------------------------------------- #
-_C.MODEL.TRANSFORMER.SGIFA = CN()
-_C.MODEL.TRANSFORMER.SGIFA.ENABLED = False
-_C.MODEL.TRANSFORMER.SGIFA.USE_UNC_GATE = True  # uncertainty-modulated gating
-_C.MODEL.TRANSFORMER.SGIFA.SKIP_FIRST = True    # skip first decoder layer (ctrl too coarse)
 
 _C.MODEL.TRANSFORMER.VOC_SIZE = 96
 _C.MODEL.TRANSFORMER.NUM_CHARS = 25
@@ -374,46 +368,11 @@ _C.MODEL.TRANSFORMER.NUM_CTRL_POINTS = 16
 
 _C.MODEL.TRANSFORMER.EPQM = False # for DPText-DETR
 _C.MODEL.TRANSFORMER.EFSA = False
+_C.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR = False  # legacy: CLIP language prior (removed)
 
-_C.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR = False
-_C.MODEL.TRANSFORMER.CLIP_MODEL_PATH = "pretrain/clip-vit-base-patch16"
-
-# ──────────────────────────────────────────────────────────────────────
-# TACT: Topology-Aware Curvature Transform
-# ──────────────────────────────────────────────────────────────────────
-# Three sub-mechanisms operate at each decoder layer after intra-SA + circonv:
-#   1. Gaussian Topology Aggregation — control-point distance weights share features
-#   2. Curvature-Aware Gating (Perona-Malik) — corners suppress, flats boost residual
-#   3. FiLM Circonv Modulation — scale-conditioned circular-conv modulation
-# All new params zero-init → training step 1 == exact baseline.
-_C.MODEL.TRANSFORMER.USE_TACT = False
-_C.MODEL.TRANSFORMER.TACT_USE_CURA = True       # curvature-aware gating (default ON)
-_C.MODEL.TRANSFORMER.TACT_SIGMA_RELAX = False
-_C.MODEL.TRANSFORMER.TACT_DECOUPLED = False
-
-# ──────────────────────────────────────────────────────────────────────
-# TGSR: Topology-Conditioned Semantic Routing
-# ──────────────────────────────────────────────────────────────────────
-# CLIP is extracted once (frozen) → patch feature map (14×14).
-# TGSR routes global + topology-conditioned local semantics to decoder
-# queries at the LAST N layers, ADDITIVE to classification logits:
-#   G = beta * [r * G_local + (1-r) * G_global]
-#   logit' = logit + G
-# where r = exp(-δ² / 2σ²) from inter-layer topology drift δ.
-# β is learnable (init 0 → no correction at start).
-# CLIP does NOT enter FPN → encoder/decoder features are pure visual.
-_C.MODEL.TRANSFORMER.USE_TGSR = False                # master switch
-_C.MODEL.TRANSFORMER.TGSR_START_LAYER = 4            # first decoder layer for routing
-_C.MODEL.TRANSFORMER.TGSR_BETA_INIT = 0.0            # β init (0 = no correction; learnable)
-_C.MODEL.TRANSFORMER.TGSR_ETA = 2.0                  # reliability sharpness
-_C.MODEL.TRANSFORMER.TGSR_SIGMA = 0.3                # topology drift bandwidth
-_C.MODEL.TRANSFORMER.TGSR_TEMP = 0.1                 # cosine-sim temperature
-_C.MODEL.TRANSFORMER.TGSR_CLIP_MODEL = "ViT-B-16"    # CLIP model name
-_C.MODEL.TRANSFORMER.TGSR_CLIP_PATH = "pretrain/clip-vit-base-patch16"
-
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # CLIP Dense Fusion (DRTP-v2)
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # Injects frozen CLIP patch tokens into FPN via dense projection +
 # spatial-aware fusion BEFORE the encoder. Enables the encoder to
 # generate semantically-informed proposals.
@@ -425,6 +384,8 @@ _C.MODEL.TRANSFORMER.CLIP_TOKEN_MIX = False          # training-only partial tok
 _C.MODEL.TRANSFORMER.CLIP_TOKEN_MIX_LAMBDA = 0.1     # mixing strength (0=aligned, 1=shuffled)
 _C.MODEL.TRANSFORMER.CLIP_PROMPT_GATE = False        # learnable prompt-based gating
 _C.MODEL.TRANSFORMER.CLIP_QUERY_FUSION = False       # query-level CLIP fusion (alt path)
+_C.MODEL.TRANSFORMER.CLIP_QUERY_ROUTING = False      # CQR: query-conditioned CLIP routing
+_C.MODEL.TRANSFORMER.CLIP_PROBE_MODE = "none"        # eval-only intervention: none|cross_image|shuffle|mean_broadcast
 _C.MODEL.TRANSFORMER.CLIP_BACKBONE = "ViT-B-16"      # CLIP model architecture
 _C.MODEL.TRANSFORMER.CLIP_PRETRAINED = "pretrain/clip-vit-base-patch16"
 _C.MODEL.TRANSFORMER.CLIP_FREEZE = True              # freeze CLIP backbone
@@ -433,25 +394,160 @@ _C.MODEL.TRANSFORMER.CLIP_DROPOUT = 0.0              # dropout on CLIP fusion
 _C.MODEL.TRANSFORMER.CLIP_ALPHA_INIT = 0.5           # alpha init for projection
 _C.MODEL.TRANSFORMER.CLIP_KEEP_ASPECT = True         # keep aspect ratio in CLIP preprocess
 
-# ── DRTP Internal Ablation (Phase 1) ──
+# -- DRTP Internal Ablation (Phase 1) --
 _C.MODEL.TRANSFORMER.CLIP_ACTIVE_LEVELS = [0, 1, 2, 3]  # which FPN levels get CLIP (0=P3, 1=P4, ...)
 _C.MODEL.TRANSFORMER.CLIP_USE_GATE = True                # False → skip GateNet, direct α*V injection
 _C.MODEL.TRANSFORMER.CLIP_LEARNABLE_ALPHA = True         # False → α frozen at CLIP_FIXED_ALPHA_VALUE
 _C.MODEL.TRANSFORMER.CLIP_FIXED_ALPHA_VALUE = 0.5        # scalar α when CLIP_LEARNABLE_ALPHA=False
 _C.MODEL.TRANSFORMER.CLIP_SHARED_PROJECTOR = False       # True → one shared projector for all levels
 _C.MODEL.TRANSFORMER.CLIP_DIRECTIONAL_GATE = False     # True → direction-aware GateNet (1×7 + 7×1 strip conv)
-_C.MODEL.TRANSFORMER.CLIP_SCALE_AWARE_GATE = False    # True → per-level ScaleAwareModulator on alpha
 
-# ──────────────────────────────────────────────────────────────────────
-# GCR: Geometric Context Refinement
-# ──────────────────────────────────────────────────────────────────────
-_C.MODEL.TRANSFORMER.GCR = CN()
-_C.MODEL.TRANSFORMER.GCR.ENABLED = False
-_C.MODEL.TRANSFORMER.GCR.HIDDEN_DIM = 128
-_C.MODEL.TRANSFORMER.GCR.CLS_BONUS = False
-_C.MODEL.TRANSFORMER.GCR.NUM_LAYERS = 1
-_C.MODEL.TRANSFORMER.GCR.COORD_ONLY = False
-_C.MODEL.TRANSFORMER.GCR.USE_ATTENTION = False
+# ----------------------------------------------------------------------
+# Self-Gated Fusion (SGF): CLIP-free variant of DRTP's dense gated residual.
+# Reuses DRTP's per-level structure (DirectionalGateNet + learnable alpha +
+# per-level independent enhancement) but generates the enhancement V from the
+# FPN features themselves:
+#     V_l = SelfGen_l(F_l);   F'_l = F_l + alpha_l * G_l * V_l
+# Zero CLIP runtime cost. DRTP-noise ablation (F1 88.45 vs DRTP-P3 88.45)
+# showed ~90% of DRTP's gain comes from the structure, not the CLIP content,
+# so SGF preserves the gain while dropping the CLIP dependency.
+_C.MODEL.TRANSFORMER.SELF_GATED_FUSION = False          # enable SGF (no CLIP needed)
+_C.MODEL.TRANSFORMER.SGF_ACTIVE_LEVELS = [0, 1, 2]      # which FPN levels get SGF (0=P3, 1=P4, ...)
+_C.MODEL.TRANSFORMER.SGF_USE_GATE = True                # False → skip GateNet, direct α*V injection
+_C.MODEL.TRANSFORMER.SGF_DIRECTIONAL_GATE = True        # True → direction-aware GateNet (1×7 + 7×1 strip conv)
+_C.MODEL.TRANSFORMER.SGF_LEARNABLE_ALPHA = True         # False → α frozen at SGF_FIXED_ALPHA_VALUE
+_C.MODEL.TRANSFORMER.SGF_FIXED_ALPHA_VALUE = 0.5        # scalar α when SGF_LEARNABLE_ALPHA=False
+
+# ----------------------------------------------------------------------
+# RICA (Residual-guided Instance Classification Attention)
+# ----------------------------------------------------------------------
+# Reuses the FINAL decoder cross-attention sampling geometry to read DRTP
+# residuals (P3/P4/P5), forming a classification-only feature h_cls:
+#   h_cls  = h_final + rica_proj([h_final, r, h_final*r, |h_final-r|])
+#   final_logits = class_embed(h_cls)
+#   final_points = point_embed(h_final)      # geometry path untouched
+# No auxiliary loss, no matcher change, no new hyper-parameters.
+# sampling_locations / attention_weights are detached; residuals and h_final
+# are NOT detached (DRTP/decoder can co-adapt with the classification task).
+_C.MODEL.TRANSFORMER.RICA_ENABLED = False                # requires USE_CLIP=True
+
+# ----------------------------------------------------------------------
+# PRICA (Point-Residual Intra-query Classification Aggregation)
+# ----------------------------------------------------------------------
+# The unified module = RICA (point-wise residual evidence extraction) + PAGA
+# (consistency-aware instance aggregation). Paper narrative: DRTP + PRICA.
+#   rica_h       = query + rica_point        # point-wise RICA evidence
+#   h_cls        = rica_h + point_delta      # RICA path KEPT + signed residual
+#   final_logits = class_embed(h_cls)        # classification path only
+#   final_points = point_embed(query)        # geometry path untouched
+# delta is ZERO at init -> PRICA starts as the identity on the original
+# classification path (preserves the RICA baseline, no warmup / no scale).
+# No new loss, no temperature, no top-k, no gate, no threshold.
+# PRICA_ENABLED takes precedence over RICA_ENABLED; requires USE_CLIP=True.
+#
+# PRICA_POINT_FEAT: ablation switch for the delta input (structure only,
+# no new loss / no new hyper-parameter — same per-point focal loss):
+#   "rica+ctx+agree" (E1, default) point_feature = [rica_point, mean/std ctx,
+#                                                   agreement, -agreement]
+#   "rica+agree"     (E2)          point_feature = [rica_point, agreement, -a]
+#   "rica"           (E3)          point_feature = rica_point
+# E1 keeps the v2 delta_proj input shape (3C+2) so old checkpoints load.
+_C.MODEL.TRANSFORMER.PRICA_ENABLED = False
+_C.MODEL.TRANSFORMER.PRICA_POINT_FEAT = "rica+ctx+agree"
+
+# ----------------------------------------------------------------------
+# CTP: CLIP Text Prior (CLIP text-prototype alignment of query cls logits)
+# ----------------------------------------------------------------------
+# CLIP-derived text/confuser prototypes supervise the decoder query
+# features (softplus margin) as a training-time auxiliary loss, PLUS a
+# classification-only residual adapter (q_cls = q + alpha * A(sg(q)))
+# active at both training and inference. Regression path untouched.
+# Semantic prior -> pairs with TACT (geometric correction).
+# See 结构/ta.txt for the design history (v1 -> noneg-nodiffw -> C/D/E).
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR = CN()
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.ENABLED = False              # master switch
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.USE_ADAPTER = True           # classification residual adapter (q_cls = q + alpha*A(sg(q)))
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.WEIGHT = 0.01                # auxiliary loss weight
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.TEMPERATURE = 0.10           # softplus temperature
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.USE_CONFUSER = True          # use 6 confuser prototypes
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.DIFFICULTY_WEIGHT = False    # nodiffw: no difficulty weighting
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.USE_NEG_BRANCH = False       # noneg: no negative branch
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.PROTO_POOLING = "max"        # max|mean: aggregate over prototypes
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.LOSS_DETACH = True           # CTP loss input detach
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.ADAPTER_DETACH_INPUT = True  # adapter input detach
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.MATCHER_BASE_LOGITS = True   # matcher uses base logits (D/E)
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.IOU_GATE = 0.5               # E: only matched queries with pred-IoU >= gate
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.PROTO_DIM = 512              # CLIP text embedding dim
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.ADAPTER_ALPHA_INIT = 0.0     # alpha init (0 = identity at start)
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.USE_MARGIN_MOD = False       # DAG fix (E2'): route projector margin into cls logits (scalar, proven ~0)
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.MARGIN_MOD_BETA_INIT = 0.0   # beta init (0 = identity at start)
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.CLIP_PRETRAINED = "pretrain/clip-vit-base-patch16"
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.TEXT_PROMPTS = [
+    "scene text",
+    "a word in a natural scene",
+    "vertical scene text",
+    "artistic but readable lettering",
+    "text on a signboard",
+    "a street sign with text",
+    "printed text on a wall",
+    "a shop name written in letters",
+    "horizontal text in an image",
+    "a label with letters",
+    "handwritten text",
+    "text in a photograph",
+]
+_C.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.CONFUSER_PROMPTS = [
+    "decorative graphic without readable text",
+    "letter-like shapes that are not actual text",
+    "a texture pattern without words",
+    "an abstract logo design",
+    "graphic elements that resemble letters",
+    "ornamental shapes in an image",
+]
+
+# ----------------------------------------------------------------------
+# TACT: Topology-Aware Curvature Transform
+# ----------------------------------------------------------------------
+# Pure-visual geometric module, injected at every decoder layer after
+# intra-SA + circonv (see 结构/tact.txt):
+#   1. Gaussian Topology Aggregation — control-point distance weights share features
+#   2. Curvature-Aware Gating (Perona-Malik) — corners suppress, flats boost residual
+#   3. FiLM Circonv Modulation — scale-conditioned circular-conv modulation
+# All new params zero-init -> training step 1 == exact baseline.
+_C.MODEL.TRANSFORMER.USE_TACT = False
+_C.MODEL.TRANSFORMER.TACT_USE_CURA = True       # curvature-aware gating (default ON)
+_C.MODEL.TRANSFORMER.TACT_SIGMA_RELAX = False
+_C.MODEL.TRANSFORMER.TACT_DECOUPLED = False
+
+# ----------------------------------------------------------------------
+# GCR: Geometric Context Refinement (几何上下文细化)
+# ----------------------------------------------------------------------
+# 纯几何修正旁路，注入到回归路径（FINAL decoder layer）：
+#   tmp = ctrl_point_coord(h_cur)          # (B,N,16,2) 未 sigmoid
+#   tmp = tmp + GCR(tmp.detach(), h_cur.detach())
+#   outputs_coord = sigmoid(tmp + reference)
+# RingConv 环形卷积（k=3 DW→PW→k=5 DW, circular pad）+ zero-init
+# output_proj → 训练起点 == baseline。数据集无关（不依赖 CLIP）。
+# 历史 GCR-only = 88.67（最强单模块）；coord-only 太弱（V49=87.80）。
+_C.MODEL.TRANSFORMER.USE_GCR = False
+_C.MODEL.TRANSFORMER.GCR_COORD_ONLY = False   # False=读 h_cur 特征（推荐）；True=仅坐标
+_C.MODEL.TRANSFORMER.GCR_HIDDEN_DIM = 128
+_C.MODEL.TRANSFORMER.GCR_ONLY_FINAL = True    # 仅在 FINAL decoder layer 注入
+
+# ----------------------------------------------------------------------
+# GATP: Geometry-Aware Text Prototype (几何感知文本原型)
+# ----------------------------------------------------------------------
+# 用几何特征（曲率/尺度）条件化的可学习文本原型，margin 注入分类 logits
+# （FINAL decoder layer，分类路径）。控制点 detach → 不影响回归。
+# 纯几何、数据集无关 → 补 CTP 跨数据集泛化短板。
+# 历史 GATP (SEED=42, CTW1500): P=90.29 / R=86.79 / F1=88.51；
+# P 暴跌（原型太宽松）→ 本版收紧：温度 + 可学习 beta 非零初始化。
+_C.MODEL.TRANSFORMER.USE_GATP = False
+_C.MODEL.TRANSFORMER.GATP_PROTO_DIM = 256
+_C.MODEL.TRANSFORMER.GATP_NUM_CONFUSER = 6
+_C.MODEL.TRANSFORMER.GATP_TEMPERATURE = 0.10
+_C.MODEL.TRANSFORMER.GATP_BETA_INIT = 0.05
+_C.MODEL.TRANSFORMER.GATP_BETA_TRAINABLE = True
 
 _C.MODEL.TRANSFORMER.LOSS = CN()
 _C.MODEL.TRANSFORMER.LOSS.AUX_LOSS = True
@@ -474,6 +570,10 @@ _C.SOLVER.LR_BACKBONE = 1e-5
 _C.SOLVER.LR_BACKBONE_NAMES = []
 _C.SOLVER.LR_LINEAR_PROJ_NAMES = []
 _C.SOLVER.LR_LINEAR_PROJ_MULT = 0.1
+# Semi-joint warm start (stage 2): multiplier applied to already-trained
+# decoder/head params. New RG-DPU params use SOLVER.BASE_LR directly.
+# 1.0 = disabled (all params use BASE_LR as usual).
+_C.SOLVER.WARMSTART_OLD_LR_FACTOR = 1.0
 
 
 _C.TEST.DET_ONLY = True

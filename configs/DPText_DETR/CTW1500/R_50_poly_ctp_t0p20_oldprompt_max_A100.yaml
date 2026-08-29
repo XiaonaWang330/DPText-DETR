@@ -1,0 +1,38 @@
+# --------------------------------------------------------------------------
+# CTP E2 reference, PINNED to the ORIGINAL 12 prompts and MAX pooling.
+#
+# Purpose: reproduce the historical baseline (F1=88.66) under the CURRENT code.
+# defaults.py TEXT_PROMPTS was changed to 16 morphology prompts, which silently
+# affects every config that relies on the default. This config pins the original
+# 12 prompts explicitly so the 88.66 reference stays reproducible.
+#
+# Use this as the ground-truth control cell for the 2x2 attribution matrix:
+#                     max pooling           mean pooling
+#     old prompts(12) THIS CONFIG (88.66)   (not run)
+#     new prompts(16) ctp_t0p20_newprompt_max_A100   ctp_t0p20_meanpool_A100
+#
+# If THIS config does not reproduce ~88.66, some other code change has
+# diverged from the original run and all comparisons are invalid.
+# --------------------------------------------------------------------------
+_BASE_: "R_50_poly_ctp_t0p20_A100.yaml"
+
+MODEL:
+  TRANSFORMER:
+    CLIP_TEXT_PRIOR:
+      PROTO_POOLING: "max"
+      TEXT_PROMPTS: [
+        "scene text",
+        "a word in a natural scene",
+        "vertical scene text",
+        "artistic but readable lettering",
+        "text on a signboard",
+        "a street sign with text",
+        "printed text on a wall",
+        "a shop name written in letters",
+        "horizontal text in an image",
+        "a label with letters",
+        "handwritten text",
+        "text in a photograph",
+      ]
+
+OUTPUT_DIR: "output/r_50_poly/ctw1500/ctp_t0p20_oldprompt_max_A100"

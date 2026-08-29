@@ -5,6 +5,30 @@ from adet.utils.misc import accuracy, generalized_box_iou, box_cxcywh_to_xyxy, b
 from detectron2.utils.comm import get_world_size
 
 
+def _ctrl_to_xyxy(ctrl):
+    """控制点 (..., 16, 2) → 轴对齐 bbox xyxy (..., 4)"""
+    x = ctrl[..., 0]
+    y = ctrl[..., 1]
+    return torch.stack(
+        [x.min(dim=-1).values, y.min(dim=-1).values,
+         x.max(dim=-1).values, y.max(dim=-1).values],
+        dim=-1,
+    )
+
+
+def _bbox_iou(b1, b2):
+    """逐对 IoU：b1, b2 (N, 4) xyxy → (N,)"""
+    x1 = torch.maximum(b1[:, 0], b2[:, 0])
+    y1 = torch.maximum(b1[:, 1], b2[:, 1])
+    x2 = torch.minimum(b1[:, 2], b2[:, 2])
+    y2 = torch.minimum(b1[:, 3], b2[:, 3])
+    inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+    a1 = (b1[:, 2] - b1[:, 0]).clamp(min=0) * (b1[:, 3] - b1[:, 1]).clamp(min=0)
+    a2 = (b2[:, 2] - b2[:, 0]).clamp(min=0) * (b2[:, 3] - b2[:, 1]).clamp(min=0)
+    union = a1 + a2 - inter
+    return inter / union.clamp(min=1e-6)
+
+
 def sigmoid_focal_loss(inputs, targets, num_inst, alpha: float = 0.25, gamma: float = 2):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
@@ -38,6 +62,10 @@ class SetCriterion(nn.Module):
             num_ctrl_points,
             focal_alpha=0.25,
             focal_gamma=2.0,
+            ta_head=None,
+            ta_temperature=0.10,
+            ta_iou_gate=0.5,
+            ta_matcher_base_logits=True,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -49,10 +77,14 @@ class SetCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.num_ctrl_points = num_ctrl_points
+        # CTP: CLIP Text Prior auxiliary loss (E variant)
+        self.ta_head = ta_head
+        self.ta_temperature = ta_temperature
+        self.ta_iou_gate = ta_iou_gate
+        self.ta_matcher_base_logits = ta_matcher_base_logits
 
     def loss_labels(self, outputs, targets, indices, num_inst, log=False):
         """Classification loss (Focal Loss)."""
-        assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
 
         idx = self._get_src_permutation_idx(indices)
@@ -137,6 +169,40 @@ class SetCriterion(nn.Module):
         loss_ctrl_points = l1.sum() / num_inst
         return {'loss_ctrl_points': loss_ctrl_points}
 
+    def loss_ta(self, outputs, targets, indices, num_inst):
+        """TA auxiliary loss (E variant): softplus(-margin/T) averaged over
+        matched queries whose predicted IoU (bbox from control points) >=
+        ta_iou_gate. Gradients flow only into the TA projector; query_feat is
+        already detached upstream (LOSS_DETACH), so the shared decoder is not
+        touched by this loss."""
+        if self.ta_head is None or 'ta_query_feat' not in outputs:
+            return {}
+        query_feat = outputs['ta_query_feat']   # (B, N, d_model)
+        pred_ctrl = outputs['pred_ctrl_points']  # (B, N, 16, 2)
+        loss_sum = None
+        n_valid = 0
+        for i, (src_i, tgt_i) in enumerate(indices):
+            n = src_i.shape[0]
+            if n == 0:
+                continue
+            qf = query_feat[i][src_i]  # (n, d_model)
+            pb = _ctrl_to_xyxy(pred_ctrl[i][src_i])               # (n, 4)
+            gb = _ctrl_to_xyxy(targets[i]['ctrl_points'][tgt_i])  # (n, 4)
+            iou = _bbox_iou(pb, gb)                                # (n,)
+            m = self.ta_head.forward_margin(qf)                    # (n,)
+            per_sample = F.softplus(-m / self.ta_temperature)      # (n,)
+            valid = iou >= self.ta_iou_gate
+            if valid.sum() == 0:
+                continue
+            l = per_sample[valid].sum()
+            loss_sum = l if loss_sum is None else loss_sum + l
+            n_valid += int(valid.sum().item())
+        if loss_sum is None:
+            loss = torch.zeros((), device=query_feat.device)
+        else:
+            loss = loss_sum / max(n_valid, 1)
+        return {'loss_ta': loss}
+
     @staticmethod
     def _get_src_permutation_idx(indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -149,6 +215,7 @@ class SetCriterion(nn.Module):
             'cardinality': self.loss_cardinality,
             'ctrl_points': self.loss_ctrl_points,
             'boxes': self.loss_boxes,
+            'ta': self.loss_ta,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_inst, **kwargs)
@@ -159,8 +226,15 @@ class SetCriterion(nn.Module):
             if k not in ('aux_outputs', 'enc_outputs')
         }
 
-        # Matching between outputs of the last layer and targets
-        indices = self.dec_matcher(outputs_without_aux, targets)
+        # Matching between outputs of the last layer and targets.
+        # CTP variant (D/E): matcher classification cost uses BASE logits
+        # (without the TA residual adapter) so matching is not perturbed by
+        # the adapter; only the classification LOSS uses the fused logits.
+        matching_outputs = outputs_without_aux
+        if self.ta_matcher_base_logits and 'pred_logits_base' in outputs_without_aux:
+            matching_outputs = dict(outputs_without_aux)
+            matching_outputs['pred_logits'] = outputs_without_aux['pred_logits_base']
+        indices = self.dec_matcher(matching_outputs, targets)
 
         # Average number of target boxes across all nodes
         num_inst = sum(len(t['ctrl_points']) for t in targets)

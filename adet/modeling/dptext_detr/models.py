@@ -6,37 +6,42 @@ from adet.layers.deformable_transformer import DeformableTransformer_Det
 from adet.utils.misc import NestedTensor, inverse_sigmoid_offset, nested_tensor_from_tensor_list, sigmoid_offset
 from .utils import MLP
 
-# CLIP Language Prior — provides text prototypes for TACT
-try:
-    from .clip_language_prior import CLIPLanguagePrior
-except Exception:
-    CLIPLanguagePrior = None
-
-# TACT: Topology-Aware Curvature Transform
-try:
-    from .tact import TACT
-except ImportError:
-    TACT = None
-
-# GCR: Geometric Context Refinement
-try:
-    from .geometric_context_refinement import GeometricContextRefinement
-except Exception:
-    GeometricContextRefinement = None
-
-# TGSR: Topology-Conditioned Semantic Routing
-try:
-    from .tgsr import TGSR, CLIPFeatureExtractor
-except ImportError:
-    TGSR = None
-    CLIPFeatureExtractor = None
-
 # CLIP Dense Fusion Adapter (DRTP-v2)
 try:
     from .clip_dense_adapter import CLIPDenseAdapter
 except ImportError:
     CLIPDenseAdapter = None
 
+# RICA: Residual-guided Instance Classification Attention (uses DRTP residuals)
+# Legacy module; superseded by PRICA (kept for checkpoint compatibility).
+try:
+    from .residual_guided_cls_attention import ResidualGuidedClsAttention
+except ImportError:
+    ResidualGuidedClsAttention = None
+
+# PRICA: Point-Residual Intra-query Classification Aggregation
+# Unified module = RICA (point-wise residual evidence extraction) + PAGA
+# (consistency-aware instance aggregation). Paper narrative: DRTP + PRICA.
+try:
+    from .prica import PRICA
+except ImportError:
+    PRICA = None
+
+# CQR: CLIP-Conditioned Query Routing
+# Each query reads local CLIP content at its predicted control points and
+# emits a classification-only logit residual (see clip_query_routing.py).
+try:
+    from .clip_query_routing import CQR
+except ImportError:
+    CQR = None
+
+# TACT: Topology-Aware Curvature Transform
+# Pure-visual geometric module (control-point distance/curvature topology),
+# injected into every decoder layer after intra-SA + circonv (see 结构/tact.txt).
+try:
+    from .tact import TACT
+except ImportError:
+    TACT = None
 
 class DPText_DETR(nn.Module):
     def __init__(self, cfg, backbone):
@@ -64,24 +69,13 @@ class DPText_DETR(nn.Module):
 
         self.epqm = cfg.MODEL.TRANSFORMER.EPQM
         self.efsa = cfg.MODEL.TRANSFORMER.EFSA
-        self.use_clip_lang_prior = cfg.MODEL.TRANSFORMER.USE_CLIP_LANG_PRIOR
-        self.enhance = cfg.MODEL.TRANSFORMER.SGIFA.ENABLED
         self.ctrl_point_embed = nn.Embedding(self.num_ctrl_points, self.d_model)
 
-        # ── CLIP Language Prior (provides text prototypes for TACT) ──
-        if self.use_clip_lang_prior:
-            if CLIPLanguagePrior is None:
-                raise ImportError(
-                    "USE_CLIP_LANG_PRIOR=True but clip_language_prior module failed to import."
-                )
-            clip_model_path = cfg.MODEL.TRANSFORMER.get("CLIP_MODEL_PATH", "")
-            self.clip_lang_prior = CLIPLanguagePrior(
-                d_model=self.d_model,
-                num_ctrl_points=self.num_ctrl_points,
-                clip_model_path=clip_model_path if clip_model_path else None,
-            )
-
-        # ── TACT: Topology-Aware Curvature Transform ──
+        # -- TACT: Topology-Aware Curvature Transform --
+        # Pure-visual geometric module injected into every decoder layer after
+        # intra-SA + circonv: Gaussian topology aggregation + curvature-aware
+        # gating + FiLM circonv modulation. All new params zero-init -> the
+        # first training step is exactly the DPText-DETR baseline.
         self.use_tact = cfg.MODEL.TRANSFORMER.get("USE_TACT", False)
         self.tact = None
         if self.use_tact:
@@ -95,7 +89,7 @@ class DPText_DETR(nn.Module):
                 use_cura=cfg.MODEL.TRANSFORMER.get("TACT_USE_CURA", True),
             )
 
-        # ── Transformer ──
+        # -- Transformer --
         self.transformer = DeformableTransformer_Det(
             d_model=self.d_model,
             nhead=self.nhead,
@@ -112,72 +106,27 @@ class DPText_DETR(nn.Module):
             num_ctrl_points=self.num_ctrl_points,
             epqm=self.epqm,
             efsa=self.efsa,
-            use_clip_lang_prior=self.use_clip_lang_prior,
-            enhance=self.enhance,
             tact_module=self.tact,
         )
 
-        # ── Classification & Regression Heads ──
+        # -- Classification & Regression Heads --
         self.ctrl_point_class = nn.Linear(self.d_model, self.num_classes)
         self.ctrl_point_coord = MLP(self.d_model, self.d_model, 2, 3)
         self.bbox_coord = MLP(self.d_model, self.d_model, 4, 3)
         self.bbox_class = nn.Linear(self.d_model, self.num_classes)
 
-        # ── GCR: Geometric Context Refinement ──
-        self.use_gcr = cfg.MODEL.TRANSFORMER.GCR.ENABLED
-        self.gcr_cls_bonus = cfg.MODEL.TRANSFORMER.GCR.CLS_BONUS
-        self.gcr_num_layers = cfg.MODEL.TRANSFORMER.GCR.get("NUM_LAYERS", 1)
-        self.gcr_coord_only = cfg.MODEL.TRANSFORMER.GCR.get("COORD_ONLY", False)
-        self.gcr_use_attention = cfg.MODEL.TRANSFORMER.GCR.get("USE_ATTENTION", False)
-        if self.use_gcr:
-            if GeometricContextRefinement is None:
-                raise ImportError("GCR.ENABLED=True but geometric_context_refinement module not found.")
-            common_kwargs = dict(
-                d_model=self.d_model,
-                num_points=self.num_ctrl_points,
-                hidden_dim=cfg.MODEL.TRANSFORMER.GCR.HIDDEN_DIM,
-                cls_bonus=self.gcr_cls_bonus,
-                coord_only=self.gcr_coord_only,
-                use_attention=self.gcr_use_attention,
-            )
-            if self.gcr_num_layers > 1:
-                self.gcr_layers = nn.ModuleList([
-                    GeometricContextRefinement(**common_kwargs)
-                    for _ in range(self.gcr_num_layers)
-                ])
-            else:
-                self.gcr = GeometricContextRefinement(**common_kwargs)
-
-        # ── TGSR: Topology-Conditioned Semantic Routing ──
-        self.use_tgsr = cfg.MODEL.TRANSFORMER.get("USE_TGSR", False)
-        self.tgsr_start_layer = cfg.MODEL.TRANSFORMER.get("TGSR_START_LAYER", 4)
-        self.tgsr = None
-        if self.use_tgsr:
-            if TGSR is None:
-                raise ImportError("USE_TGSR=True but tgsr module not found.")
-            clip_extractor = CLIPFeatureExtractor(
-                pretrained_path=cfg.MODEL.TRANSFORMER.get("TGSR_CLIP_PATH", "pretrain/clip-vit-base-patch16"),
-                freeze=True,
-            )
-            self.tgsr = TGSR(
-                clip_extractor=clip_extractor,
-                d_model=self.d_model,
-                num_ctrl_points=self.num_ctrl_points,
-                beta_init=cfg.MODEL.TRANSFORMER.get("TGSR_BETA_INIT", 0.0),
-                eta=cfg.MODEL.TRANSFORMER.get("TGSR_ETA", 2.0),
-                sigma=cfg.MODEL.TRANSFORMER.get("TGSR_SIGMA", 0.3),
-                temperature=cfg.MODEL.TRANSFORMER.get("TGSR_TEMP", 0.1),
-                start_layer=self.tgsr_start_layer,
-            )
-
-        # ── CLIP Dense Fusion Adapter (DRTP-v2) ──
+        # -- CLIP Dense Fusion Adapter (DRTP-v2) --
         # Fuses frozen CLIP patch tokens into FPN features BEFORE the encoder.
         # Read from yaml-only keys registered in defaults.py.
+        # CLIP_DENSE_FUSION=False skips building the adapter entirely so RICA
+        # can run alone on raw FPN features (RICA-only ablation).
         self.use_clip = cfg.MODEL.TRANSFORMER.get("USE_CLIP", False)
+        self.clip_dense_fusion = cfg.MODEL.TRANSFORMER.get("CLIP_DENSE_FUSION", False)
+        self.selfgen_fusion = cfg.MODEL.TRANSFORMER.get("SELF_GATED_FUSION", False)
         self.clip_adapter = None
-        if self.use_clip:
+        if (self.use_clip and self.clip_dense_fusion) or self.selfgen_fusion:
             if CLIPDenseAdapter is None:
-                raise ImportError("USE_CLIP=True but clip_dense_adapter module not found.")
+                raise ImportError("USE_CLIP/SELF_GATED_FUSION=True but clip_dense_adapter module not found.")
             self.clip_adapter = CLIPDenseAdapter(
                 clip_model_name=cfg.MODEL.TRANSFORMER.get("CLIP_PRETRAINED", "pretrain/clip-vit-base-patch16"),
                 d_model=self.d_model,
@@ -188,17 +137,150 @@ class DPText_DETR(nn.Module):
                 replace_noise=cfg.MODEL.TRANSFORMER.get("CLIP_REPLACE_NOISE", False),
                 token_mix=cfg.MODEL.TRANSFORMER.get("CLIP_TOKEN_MIX", False),
                 mix_lambda=cfg.MODEL.TRANSFORMER.get("CLIP_TOKEN_MIX_LAMBDA", 0.1),
-                # ── Phase 1 ablation ──
+                # -- Phase 1 ablation --
                 active_levels=cfg.MODEL.TRANSFORMER.get("CLIP_ACTIVE_LEVELS", [0, 1, 2, 3]),
                 use_gate=cfg.MODEL.TRANSFORMER.get("CLIP_USE_GATE", True),
                 learnable_alpha=cfg.MODEL.TRANSFORMER.get("CLIP_LEARNABLE_ALPHA", True),
                 fixed_alpha_value=cfg.MODEL.TRANSFORMER.get("CLIP_FIXED_ALPHA_VALUE", 0.5),
                 shared_projector=cfg.MODEL.TRANSFORMER.get("CLIP_SHARED_PROJECTOR", False),
                 directional_gate=cfg.MODEL.TRANSFORMER.get("CLIP_DIRECTIONAL_GATE", False),
-                scale_aware_gate=cfg.MODEL.TRANSFORMER.get("CLIP_SCALE_AWARE_GATE", False),
+                probe_mode=cfg.MODEL.TRANSFORMER.get("CLIP_PROBE_MODE", "none"),
+                # -- Self-Gated Fusion (CLIP-free) --
+                selfgen=self.selfgen_fusion,
+                selfgen_active_levels=cfg.MODEL.TRANSFORMER.get("SGF_ACTIVE_LEVELS", [0, 1, 2]),
+                selfgen_use_gate=cfg.MODEL.TRANSFORMER.get("SGF_USE_GATE", True),
+                selfgen_directional_gate=cfg.MODEL.TRANSFORMER.get("SGF_DIRECTIONAL_GATE", True),
+                selfgen_learnable_alpha=cfg.MODEL.TRANSFORMER.get("SGF_LEARNABLE_ALPHA", True),
+                selfgen_fixed_alpha_value=cfg.MODEL.TRANSFORMER.get("SGF_FIXED_ALPHA_VALUE", 0.5),
             )
 
-        # ── Input Projection (FPN → d_model) ──
+        # -- RICA: Residual-guided Instance Classification Attention --
+        # Reuses the final decoder cross-attention sampling geometry to read
+        # DRTP residuals, forming a classification-only feature h_cls:
+        #   final_logits = class_embed(h_cls), final_points = point_embed(h_final)
+        # No geometry changes, no auxiliary loss, no new hyper-parameters.
+        self.use_rica = cfg.MODEL.TRANSFORMER.get("RICA_ENABLED", False) and self.use_clip
+        self.rica = None
+        if self.use_rica:
+            if ResidualGuidedClsAttention is None:
+                raise ImportError("RICA_ENABLED=True but residual_guided_cls_attention module not found.")
+            self.rica = ResidualGuidedClsAttention(
+                d_model=self.d_model,
+                num_levels=len(cfg.MODEL.TRANSFORMER.get("CLIP_ACTIVE_LEVELS", [0, 1, 2])),
+                n_heads=self.nhead,
+                n_points=self.dec_n_points,
+                active_cross_levels=cfg.MODEL.TRANSFORMER.get("CLIP_ACTIVE_LEVELS", [0, 1, 2]),
+            )
+
+        # -- PRICA: Point-Residual Intra-query Classification Aggregation --
+        # The unified module (RICA + PAGA). PRICA extracts per-point residual
+        # classification evidence, weights points by query-residual agreement,
+        # and aggregates them into an instance-level refinement delta:
+        #   h_cls = query + delta.unsqueeze(2)     # residual refinement
+        #   final_logits = class_embed(h_cls)      # classification path only
+        #   final_points = point_embed(query)      # geometry path untouched
+        # delta is ZERO at init -> PRICA starts as the identity on the original
+        # classification path (the RICA baseline is preserved, not replaced).
+        self.use_prica = cfg.MODEL.TRANSFORMER.get("PRICA_ENABLED", False) and self.use_clip
+        self.prica = None
+        if self.use_prica:
+            if PRICA is None:
+                raise ImportError("PRICA_ENABLED=True but prica module not found.")
+            self.prica = PRICA(
+                d_model=self.d_model,
+                num_levels=len(cfg.MODEL.TRANSFORMER.get("CLIP_ACTIVE_LEVELS", [0, 1, 2])),
+                n_heads=self.nhead,
+                n_points=self.dec_n_points,
+                active_cross_levels=cfg.MODEL.TRANSFORMER.get("CLIP_ACTIVE_LEVELS", [0, 1, 2]),
+                point_feat_mode=cfg.MODEL.TRANSFORMER.get(
+                    "PRICA_POINT_FEAT", "rica+ctx+agree"),
+            )
+
+        # -- CQR: CLIP-Conditioned Query Routing --
+        # Classification-only logit residual. Each query samples the raw CLIP
+        # patch content at its predicted control-point locations (detached) and
+        # modulates its class logit via a point-wise multiplicative interaction:
+        #   delta_logit = cqr_cls_head(out_norm(interaction(h_cur, clip_at_pts)))
+        #   final_logits = base_logits + delta_logit    (zero-init => identity)
+        # The regression path (h_cur -> ctrl_point_coord) is untouched.
+        self.use_cqr = cfg.MODEL.TRANSFORMER.get("CLIP_QUERY_ROUTING", False) and self.use_clip
+        self.cqr = None
+        if self.use_cqr:
+            if CQR is None:
+                raise ImportError("CLIP_QUERY_ROUTING=True but clip_query_routing module not found.")
+            if self.clip_adapter is None:
+                raise ImportError("CLIP_QUERY_ROUTING=True but no CLIP adapter (need CLIP_DENSE_FUSION=True).")
+            self.cqr = CQR(
+                d_model=self.d_model,
+                clip_dim=self.clip_adapter.clip_dim,
+                clip_patch_size=self.clip_adapter.clip_patch_size,
+            )
+
+        # -- CTP: CLIP Text Prior (CLIP text-prototype alignment) --
+        # CLIP-derived text/confuser prototypes supervise the decoder query
+        # features (softplus margin) as a training-time auxiliary loss, PLUS a
+        # classification-only residual adapter (q_cls = q + alpha * A(sg(q)))
+        # active at both training and inference. Regression path untouched.
+        # Semantic prior -> pairs with TACT (geometric correction). Internal
+        # identifiers below keep the historical ta_head / ta_* names.
+        self.ta_enabled = cfg.MODEL.TRANSFORMER.get("CLIP_TEXT_PRIOR", None) is not None and \
+            cfg.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR.ENABLED
+        self.ta_head = None
+        if self.ta_enabled:
+            from .clip_text_prior import TextPrototypeAlignmentHead
+            ta_cfg = cfg.MODEL.TRANSFORMER.CLIP_TEXT_PRIOR
+            self.ta_head = TextPrototypeAlignmentHead(
+                d_model=self.d_model,
+                proto_dim=ta_cfg.PROTO_DIM,
+                use_confuser=ta_cfg.USE_CONFUSER,
+                temperature=ta_cfg.TEMPERATURE,
+                clip_model_name=ta_cfg.CLIP_PRETRAINED,
+                text_prompts=list(ta_cfg.TEXT_PROMPTS),
+                confuser_prompts=list(ta_cfg.CONFUSER_PROMPTS),
+                adapter_detach_input=ta_cfg.ADAPTER_DETACH_INPUT,
+                alpha_init=ta_cfg.ADAPTER_ALPHA_INIT,
+                use_adapter=ta_cfg.USE_ADAPTER,
+                use_margin_mod=ta_cfg.USE_MARGIN_MOD,
+                margin_mod_beta_init=ta_cfg.MARGIN_MOD_BETA_INIT,
+                proto_pooling=ta_cfg.PROTO_POOLING,
+            )
+            self.ta_matcher_base_logits = ta_cfg.MATCHER_BASE_LOGITS
+            self.ta_loss_detach = ta_cfg.LOSS_DETACH
+
+        # -- GCR: Geometric Context Refinement (纯几何回归修正) --
+        # 回归路径（FINAL layer）：tmp = ctrl_point_coord(h_cur) 后加
+        # GCR(tmp.detach(), h_cur.detach())，RingConv 环形卷积修正。
+        # 数据集无关（不依赖 CLIP），与 CTP（分类路径）互补。
+        self.use_gcr = cfg.MODEL.TRANSFORMER.get("USE_GCR", False)
+        self.gcr = None
+        self.gcr_only_final = cfg.MODEL.TRANSFORMER.get("GCR_ONLY_FINAL", True)
+        if self.use_gcr:
+            from .geometric_context_refinement import GeometricContextRefinement
+            self.gcr = GeometricContextRefinement(
+                d_model=self.d_model,
+                num_ctrl_points=self.num_ctrl_points,
+                hidden_dim=cfg.MODEL.TRANSFORMER.get("GCR_HIDDEN_DIM", 128),
+                coord_only=cfg.MODEL.TRANSFORMER.get("GCR_COORD_ONLY", False),
+            )
+
+        # -- GATP: Geometry-Aware Text Prototype (几何感知文本原型) --
+        # 分类路径（FINAL layer）：用控制点曲率/尺度条件化的可学习文本
+        # 原型 margin 注入分类 logits。纯几何、数据集无关。
+        self.use_gatp = cfg.MODEL.TRANSFORMER.get("USE_GATP", False)
+        self.gatp = None
+        if self.use_gatp:
+            from .geometry_aware_text_prototype import GeometryAwareTextPrototype
+            self.gatp = GeometryAwareTextPrototype(
+                d_model=self.d_model,
+                proto_dim=cfg.MODEL.TRANSFORMER.get("GATP_PROTO_DIM", 256),
+                num_ctrl_points=self.num_ctrl_points,
+                num_confuser=cfg.MODEL.TRANSFORMER.get("GATP_NUM_CONFUSER", 6),
+                temperature=cfg.MODEL.TRANSFORMER.get("GATP_TEMPERATURE", 0.10),
+                beta_init=cfg.MODEL.TRANSFORMER.get("GATP_BETA_INIT", 0.05),
+                beta_trainable=cfg.MODEL.TRANSFORMER.get("GATP_BETA_TRAINABLE", True),
+            )
+
+        # -- Input Projection (FPN → d_model) --
         if self.num_feature_levels > 1:
             _resnet_ch_map = {"res3": 512, "res4": 1024, "res5": 2048}
             _resnet_st_map = {"res3": 8, "res4": 16, "res5": 32}
@@ -234,7 +316,7 @@ class DPText_DETR(nn.Module):
 
         self.aux_loss = cfg.MODEL.TRANSFORMER.AUX_LOSS
 
-        # ── Head Initialization ──
+        # -- Head Initialization --
         prior_prob = 0.01
         bias_value = -np.log((1 - prior_prob) / prior_prob)
         self.ctrl_point_class.bias.data = torch.ones(self.num_classes) * bias_value
@@ -265,8 +347,7 @@ class DPText_DETR(nn.Module):
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
 
             clip_images: optional list of (3, H_i, W_i) raw image tensors (geometrically
-                         transformed but NOT detector-normalized) for TGSR CLIP feature extraction.
-                         Only used when USE_TGSR=True.
+                         transformed but NOT detector-normalized) for CLIP adapter.
         """
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
@@ -297,76 +378,119 @@ class DPText_DETR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        # ── CLIP Dense Fusion: inject frozen CLIP tokens into FPN features ──
-        if self.clip_adapter is not None and clip_images is not None:
-            srcs = self.clip_adapter(clip_images, srcs, masks)
-
-        # ── TGSR: Extract CLIP features (once, frozen) ──
-        clip_feat_map = None
-        if self.tgsr is not None and clip_images is not None:
-            clip_tensor = CLIPFeatureExtractor.prepare_images(clip_images, device=self.device)
-            clip_feat_map = self.tgsr.clip_extractor(clip_tensor)  # (B, 512, 14, 14)
+        # -- CLIP Dense Fusion: inject frozen CLIP tokens into FPN features --
+        # RICA-only / PRICA-only mode (CLIP_DENSE_FUSION=False, RICA/PRICA
+        # enabled): no adapter is built, so the module samples the RAW FPN
+        # features directly to isolate its standalone contribution from DRTP.
+        clip_residuals = None
+        if self.clip_adapter is not None:
+            if self.selfgen_fusion:
+                # SGF: CLIP-free self-gated fusion (no clip_images needed)
+                srcs = self.clip_adapter.forward_selfgen(srcs, masks)
+            elif clip_images is not None:
+                srcs = self.clip_adapter(clip_images, srcs, masks)
+            # Pre-fusion per-level CLIP residuals for RICA (None if inactive level)
+            clip_residuals = self.clip_adapter.get_last_residuals()
+        elif (self.rica is not None or self.prica is not None) and not self.clip_dense_fusion:
+            clip_residuals = srcs
 
         # n_pts, embed_dim --> n_q, n_pts, embed_dim
         ctrl_point_embed = self.ctrl_point_embed.weight[None, ...].repeat(self.num_proposals, 1, 1)
 
-        # CLIP language prior (provides text prototypes for TACT)
-        c_lang, v_spatial = None, None
-        if self.use_clip_lang_prior:
-            c_lang, v_spatial = self.clip_lang_prior(srcs[-2], srcs[-1])
-
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, dec_unc = self.transformer(
-            srcs, masks, pos, ctrl_point_embed, c_lang=c_lang, v_spatial=v_spatial
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(
+            srcs,
+            masks,
+            pos,
+            ctrl_point_embed,
+            clip_residuals=clip_residuals,
         )
 
         outputs_classes = []
         outputs_coords = []
-        gcr_cls_bonus_last = None
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 reference = init_reference
             else:
                 reference = inter_references[lvl - 1]
-            # Save original [0,1] reference for TGSR before inverse_sigmoid
-            ref_original = reference
             reference = inverse_sigmoid_offset(reference, offset=self.sigmoid_offset)
 
             h_cur = hs[lvl]
 
-            outputs_class = self.ctrl_point_class[lvl](h_cur)
+            # Classification feature: on the FINAL decoder layer only, enhance
+            # h_cur by reading DRTP residuals at the original cross-attention
+            # sampling sites. The geometry path keeps using the original h_cur
+            # (classification residual never touches it).
+            h_cls = h_cur
+            if lvl == hs.shape[0] - 1 and clip_residuals is not None:
+                sampling_locations = getattr(self.transformer, "_last_dec_sampling_locations", None)
+                attention_weights = getattr(self.transformer, "_last_dec_attention_weights", None)
+                if (self.prica is not None or self.rica is not None) and \
+                        (sampling_locations is None or attention_weights is None):
+                    raise RuntimeError(
+                        "PRICA/RICA enabled but no decoder cross-attention details exposed")
+
+                if self.prica is not None:
+                    # PRICA (RICA + point-wise signed residual refinement — see
+                    # prica.py docstring for the v1 -> v2 motivation and the
+                    # E1 wiring fix):
+                    #   rica_h       = query + rica_point   (point-wise RICA,
+                    #                                        KEPT in the
+                    #                                        classification path)
+                    #   point_delta  = delta_proj(<mode-dependent per-point
+                    #                              feature>) (B,K,N,C) SIGNED
+                    #   h_cls        = rica_h + point_delta
+                    # E1 fix: the validated RICA evidence path is no longer
+                    # discarded (diagnosis: query + point_delta lost ~0.4 F1
+                    # vs RICA 88.57 / DRTP+RICA 88.72 vs DRTP+PRICA 88.31);
+                    # the signed per-point delta only refines rica_h.
+                    rica_h, point_delta, point_weight = self.prica(
+                        query=h_cur,
+                        residual_features=clip_residuals,
+                        sampling_locations=sampling_locations,
+                        attention_weights=attention_weights,
+                    )
+                    h_cls = rica_h + point_delta
+                    self._last_prica_point_weight = point_weight
+                elif self.rica is not None:
+                    # Legacy RICA (kept for checkpoint compatibility).
+                    h_cls = self.rica(
+                        h_final=h_cur,
+                        residual_features=clip_residuals,
+                        sampling_locations=sampling_locations,
+                        attention_weights=attention_weights,
+                    )
+
+            # -- TA: classification-only residual adapter (FINAL layer only) --
+            # q_cls = q + alpha * A(sg(q)); regression path (h_cur) untouched.
+            # Exposes (i) base logits for the Hungarian matcher (E variant) and
+            # (ii) instance-level query features for the TA auxiliary loss.
+            if self.ta_enabled and lvl == hs.shape[0] - 1:
+                if self.ta_matcher_base_logits:
+                    self._ta_base_logits = self.ctrl_point_class[lvl](h_cls)
+                ta_query_feat = h_cur.mean(dim=2)  # (B, N, d_model)
+                if self.ta_loss_detach:
+                    ta_query_feat = ta_query_feat.detach()
+                self._ta_query_feat = ta_query_feat
+
+                # 分类残差 adapter（q_cls = q + alpha * A(sg(q))），逐点广播
+                h_cls = self.ta_head.forward_adapter(h_cls)
+                outputs_class = self.ctrl_point_class[lvl](h_cls)
+                # -- CTP margin modulation (DAG fix): route projector margin
+                # into logits as a scalar beta*margin residual.
+                if self.ta_head.use_margin_mod:
+                    outputs_class = outputs_class + self.ta_head.margin_modulation(ta_query_feat.detach()).unsqueeze(2)
+            else:
+                outputs_class = self.ctrl_point_class[lvl](h_cls)
             tmp = self.ctrl_point_coord[lvl](h_cur)
 
-            # ── GCR: Geometric Context Refinement ──
-            if self.use_gcr:
-                total_layers = hs.shape[0]
-                gcr_start_layer = total_layers - self.gcr_num_layers
-                if lvl >= gcr_start_layer:
-                    if self.gcr_num_layers > 1:
-                        gcr_mod = self.gcr_layers[lvl - gcr_start_layer]
-                    else:
-                        gcr_mod = self.gcr
-                    need_cls_bonus = (
-                        self.gcr_cls_bonus and lvl == total_layers - 1
-                    )
-                    correction, gcr_cls_bonus_last = gcr_mod(
-                        tmp.detach(),
-                        None if self.gcr_coord_only else h_cur.detach(),
-                        return_cls_bonus=need_cls_bonus,
-                    )
-                    tmp = tmp + correction
-                    if gcr_cls_bonus_last is not None:
-                        outputs_class = outputs_class + gcr_cls_bonus_last
-
-            # ── TGSR: Topology-Conditioned Semantic Routing ──
-            # Applied at layers >= start_layer, ADDITIVE to classification logits
-            if clip_feat_map is not None and lvl >= self.tgsr_start_layer:
-                if lvl == self.tgsr_start_layer:
-                    ref_prev = ref_original  # same → r=1 → local CLIP only
-                else:
-                    ref_prev = inter_references[lvl - 2]  # (B, N, K, 2)
-                tgsr_correction = self.tgsr(clip_feat_map, ref_original, ref_prev)  # (B, N, 1)
-                tgsr_correction = tgsr_correction.unsqueeze(-1)  # (B, N, 1, 1) → broadcast to (B, N, K, 1)
-                outputs_class = outputs_class + tgsr_correction
+            # -- GCR: geometric context refinement (regression path) --
+            # tmp = tmp + RingConv-corrected delta. Inputs detached -> pure
+            # geometric side-path; zero-init output_proj -> starts as baseline.
+            # Dataset-agnostic (no CLIP) -> complements CTP across datasets.
+            if self.gcr is not None and (
+                    not self.gcr_only_final or lvl == hs.shape[0] - 1):
+                gcr_delta = self.gcr(tmp.detach(), h_cur.detach())
+                tmp = tmp + gcr_delta
 
             if reference.shape[-1] == 2:
                 if self.epqm:
@@ -380,19 +504,67 @@ class DPText_DETR(nn.Module):
                 else:
                     tmp += reference[:, :, None, :2]
             outputs_coord = sigmoid_offset(tmp, offset=self.sigmoid_offset)
+
+            # -- CQR: query-conditioned CLIP logit residual (FINAL layer only) --
+            # Samples raw CLIP patch content at the (detached) predicted control
+            # points and adds a classification-only delta to the base logits.
+            if self.use_cqr and lvl == hs.shape[0] - 1:
+                if self.clip_adapter is not None:
+                    clip_map, content_hw = self.clip_adapter.get_last_cqr_inputs()
+                    if clip_map is not None:
+                        cqr_delta = self.cqr(
+                            h_cur=h_cur,
+                            points=outputs_coord.detach(),
+                            clip_map=clip_map,
+                            content_hw=content_hw,
+                        )
+                        outputs_class = outputs_class + cqr_delta.type_as(outputs_class)
+
+            # -- GATP: geometry-aware text prototype (FINAL layer only) --
+            # 用预测控制点（detach）的曲率/尺度条件化可学习文本原型，
+            # margin 注入分类 logits。纯几何、数据集无关。
+            if self.gatp is not None and lvl == hs.shape[0] - 1:
+                q_inst = h_cur.mean(dim=2)                    # (B, N, d_model)
+                pts = outputs_coord.detach()                  # (B, N, P, 2)
+                outputs_class = self.gatp.forward_logits(
+                    outputs_class, q_inst, pts)
+
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
 
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        out = {'pred_logits': outputs_class[-1], 'pred_ctrl_points': outputs_coord[-1]}
+        # Matcher / classification loss / inference all use the SAME logits.
+        # RICA only changed the feature feeding class_embed on the last layer
+        # (h_cls), so no second logits set is needed.
+        out = {
+            'pred_logits': outputs_class[-1],
+            'pred_ctrl_points': outputs_coord[-1],
+        }
+
+        # TA: expose base logits (matcher, E variant) and instance-level query
+        # features (auxiliary loss). Only present when TA is enabled.
+        if self.ta_enabled:
+            out['pred_logits_base'] = self._ta_base_logits
+            out['ta_query_feat'] = self._ta_query_feat
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
         enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
         out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+
+        # Diagnostic: expose reference points for per-layer coverage analysis
+        out['reference_points'] = {
+            'init_reference': init_reference,
+            'inter_references': inter_references,
+        }
+
+        # Diagnostic: PRICA point-level consistency weights (for TP/FP/FN
+        # point-weight analysis in paper visualization). Detached already.
+        if self.prica is not None and getattr(self, "_last_prica_point_weight", None) is not None:
+            out['prica_point_weight'] = self._last_prica_point_weight
 
         return out
 

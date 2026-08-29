@@ -18,6 +18,35 @@ CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
+def _geom_quality(poly):
+    """
+    Replicates tools/validate_gq.py geom_feats()['quality'] on torch tensors.
+    Validated on ctw1500 drtp dump: sqrt fusion rescues 49/178 rescuable GT
+    with 0 killed TP / 0 suppressed FP / 0 new FN.
+
+    poly: (K, 16, 2) normalized control points. Returns (K,) quality in [0, 1].
+    """
+    edges = poly - poly.roll(1, dims=-2)                         # (K,16,2)
+    edge_lens = torch.sqrt((edges ** 2).sum(-1))                 # (K,16)
+    # numpy var defaults to ddof=0; torch var must set unbiased=False to match
+    regularity = torch.exp(-edge_lens.var(dim=-1, unbiased=False) * 10)  # (K,)
+
+    v2 = edges.roll(-1, dims=-2)
+    cross = edges[..., 0] * v2[..., 1] - edges[..., 1] * v2[..., 0]
+    convexity = (cross > 0).float().mean(dim=-1)                 # (K,)
+
+    perimeter = edge_lens.sum(-1)                                # (K,)
+    x, y = poly[..., 0], poly[..., 1]
+    area = 0.5 * torch.abs(
+        (x * y.roll(-1, dims=-2) - x.roll(-1, dims=-2) * y).sum(-1)
+    )                                                            # (K,)
+    compactness = area / (perimeter + 1e-6)
+    compactness = compactness / (compactness.mean() + 1e-6)      # per-image norm
+
+    return (0.4 * regularity + 0.3 * convexity
+            + 0.3 * torch.clamp(compactness, 0, 1))
+
+
 class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
@@ -107,6 +136,7 @@ class TransformerPureDetector(nn.Module):
         d2_backbone = MaskedBackbone(cfg)
         N_steps = cfg.MODEL.TRANSFORMER.HIDDEN_DIM // 2
         self.test_score_threshold = cfg.MODEL.TRANSFORMER.INFERENCE_TH_TEST
+        self.gq_reorder = cfg.MODEL.TRANSFORMER.get("GQ_REORDER", False)
         self.use_polygon = cfg.MODEL.TRANSFORMER.USE_POLYGON
         self.num_ctrl_points = cfg.MODEL.TRANSFORMER.NUM_CTRL_POINTS
         assert self.use_polygon and self.num_ctrl_points == 16  # only the polygon version is released now
@@ -118,6 +148,7 @@ class TransformerPureDetector(nn.Module):
 
         loss_cfg = cfg.MODEL.TRANSFORMER.LOSS
         weight_dict = {'loss_ce': loss_cfg.POINT_CLASS_WEIGHT, 'loss_ctrl_points': loss_cfg.POINT_COORD_WEIGHT}
+
         enc_weight_dict = {
             'loss_bbox': loss_cfg.BOX_COORD_WEIGHT,
             'loss_giou': loss_cfg.BOX_GIOU_WEIGHT,
@@ -137,6 +168,16 @@ class TransformerPureDetector(nn.Module):
         enc_losses = ['labels', 'boxes']
         dec_losses = ['labels', 'ctrl_points']
 
+        # CTP: CLIP Text Prior auxiliary loss (training-time). Adds loss_ta to
+        # the weight dict and the decoder losses; the criterion receives the
+        # CTP head for margin computation plus the IoU gate / matcher options.
+        # Internal ta_* identifiers are kept for historical continuity.
+        ta_cfg = cfg.MODEL.TRANSFORMER.get("CLIP_TEXT_PRIOR", None)
+        ta_enabled = ta_cfg is not None and ta_cfg.ENABLED
+        if ta_enabled:
+            weight_dict['loss_ta'] = ta_cfg.WEIGHT
+            dec_losses = ['labels', 'ctrl_points', 'ta']
+
         self.criterion = SetCriterion(
             self.dptext_detr.num_classes,
             box_matcher,
@@ -147,6 +188,10 @@ class TransformerPureDetector(nn.Module):
             self.dptext_detr.num_ctrl_points,
             focal_alpha=loss_cfg.FOCAL_ALPHA,
             focal_gamma=loss_cfg.FOCAL_GAMMA,
+            ta_head=self.dptext_detr.ta_head if ta_enabled else None,
+            ta_temperature=ta_cfg.TEMPERATURE if ta_enabled else 0.10,
+            ta_iou_gate=ta_cfg.IOU_GATE if ta_enabled else 0.5,
+            ta_matcher_base_logits=ta_cfg.MATCHER_BASE_LOGITS if ta_enabled else True,
         )
 
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
@@ -168,7 +213,8 @@ class TransformerPureDetector(nn.Module):
         These are geometrically transformed (resize/crop/flip) but NOT detector-normalized.
         Returns a list of (3, H, W) tensors, or None if no CLIP module is active.
         """
-        if not (self.dptext_detr.use_clip or self.dptext_detr.use_tgsr):
+        needs_clip = self.dptext_detr.use_clip
+        if not needs_clip:
             return None
         return [x["image"].to(self.device) for x in batched_inputs]
 
@@ -249,6 +295,12 @@ class TransformerPureDetector(nn.Module):
         for scores_per_image, labels_per_image, ctrl_point_per_image, image_size in zip(
                 scores, labels, ctrl_point_coord, image_sizes
         ):
+            if self.gq_reorder:
+                # sqrt geometric re-ranking: score' = sqrt(base * geom_quality)
+                q = _geom_quality(ctrl_point_per_image)
+                scores_per_image = torch.sqrt(
+                    scores_per_image.clamp(0, 1) * q.clamp(0, 1)
+                )
             selector = scores_per_image >= self.test_score_threshold
             scores_per_image = scores_per_image[selector]
             labels_per_image = labels_per_image[selector]
